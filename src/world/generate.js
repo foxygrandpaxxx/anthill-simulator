@@ -63,7 +63,7 @@ export function generateWorld({
   sandDepth = 10,
   clayDepth = 16,
   // remaining depth below clay becomes rock
-  surfaceFoodClusters = 80, // food piles scattered across the surface (forage reserve)
+  surfaceFoodClusters = 120, // food piles scattered across the surface (forage reserve)
   surfaceFoodClusterSize = 6,
 } = {}) {
   const world = new World(sx, sy, sz);
@@ -97,17 +97,8 @@ export function generateWorld({
           if (r > 0.92) mat = Material.ROCK;
         }
 
-        // Scatter buried food pockets through the soil (now also in clay, so
-        // there's plenty of hidden food deep down to dig toward).
-        if (
-          mat === Material.SAND ||
-          mat === Material.CLAY ||
-          (mat === Material.TOPSOIL && depth >= 2)
-        ) {
-          const f = foodNoise(x - z * 0.4, z + y * 0.6);
-          if (f > 0.84) mat = Material.FOOD;
-        }
-
+        // (Food is surface-only now — foraging happens above ground; tunnels
+        // are for breeding and storage. No buried food.)
         world.set(x, y, z, mat);
       }
     }

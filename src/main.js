@@ -98,6 +98,10 @@ xrayBtn.addEventListener("click", () => {
 
 regenBtn.addEventListener("click", regenerate);
 
+document.getElementById("spawnBug").addEventListener("click", () => {
+  if (sim) sim.spawnBug();
+});
+
 // --- Live tuning: bind [data-cfg] sliders to sim.cfg ----------------------
 const tuningInputs = document.querySelectorAll("#tuningWrap input[data-cfg]");
 function fmtTuning(input) {

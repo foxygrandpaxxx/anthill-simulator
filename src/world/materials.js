@@ -10,6 +10,7 @@ export const Material = Object.freeze({
   FOOD: 5, // natural food (surface + buried) that foragers harvest
   SPOIL: 6, // excavated dirt deposited on the surface (the tumulus / mound)
   STORE: 7, // food placed in storage chambers (visual representation of stores)
+  CARCASS: 8, // a spawned bug (beetle/grasshopper) ants chip apart for food
 });
 
 // Base RGB colors (0..1), tuned for an earthy ant-farm cross-section look.
@@ -21,6 +22,7 @@ export const MATERIAL_COLOR = {
   [Material.FOOD]: [0.42, 0.70, 0.27],
   [Material.SPOIL]: [0.30, 0.20, 0.12], // freshly turned earth, slightly darker
   [Material.STORE]: [0.85, 0.70, 0.20], // stored food — warm gold, reads as a larder
+  [Material.CARCASS]: [0.30, 0.42, 0.18], // bug — dark chitinous green
 };
 
 export function isSolid(m) {

@@ -11,12 +11,18 @@ import { Material, isDiggable } from "../world/materials.js";
 
 export const DEFAULT_BLUEPRINT_CONFIG = {
   firstChamberDepth: 7, // voxels below surface for the first chamber center
-  chamberSpacingY: 6, // vertical interval between chambers
+  chamberSpacingY: 6, // baseline distance between connected chambers
   chamberRX: 3, // horizontal radius (x)
   chamberRZ: 3, // horizontal radius (z)
   chamberRY: 2, // vertical radius (oblate: flatter than wide)
-  branchReach: 4, // how far a chamber sits to the side of the shaft
+  chamberSizeVar: 0.5, // ± fraction of random radius variation per chamber
   bedrockMargin: 3, // stop digging this many voxels above the lowest soil
+  surfaceMargin: 4, // keep chamber centres at least this far below the surface
+  // Organic branching growth
+  branchTries: 14, // candidate placements considered per new chamber
+  minSeparation: 1.7, // chamber spacing as a multiple of radius (no overlap)
+  downwardBias: 0.45, // 0..1 how strongly new chambers tend deeper vs outward
+  wanderChance: 0.22, // chance of a sideways "wander" step when carving tunnels
 };
 
 export class Blueprint {
@@ -102,16 +108,15 @@ export class Blueprint {
     this._plan(x1, y1, z1);
   }
 
-  _addChamberAt(cx, cy, cz, type) {
-    const { chamberRX, chamberRY, chamberRZ } = this.cfg;
+  _addChamberAt(cx, cy, cz, type, rxIn, ryIn, rzIn) {
+    const rx = rxIn || this.cfg.chamberRX;
+    const ry = ryIn || this.cfg.chamberRY;
+    const rz = rzIn || this.cfg.chamberRZ;
     const cells = [];
-    for (let dy = -chamberRY; dy <= chamberRY; dy++) {
-      for (let dz = -chamberRZ; dz <= chamberRZ; dz++) {
-        for (let dx = -chamberRX; dx <= chamberRX; dx++) {
-          const nx = (dx / chamberRX) ** 2;
-          const ny = (dy / chamberRY) ** 2;
-          const nz = (dz / chamberRZ) ** 2;
-          if (nx + ny + nz > 1.0) continue;
+    for (let dy = -ry; dy <= ry; dy++) {
+      for (let dz = -rz; dz <= rz; dz++) {
+        for (let dx = -rx; dx <= rx; dx++) {
+          if ((dx / rx) ** 2 + (dy / ry) ** 2 + (dz / rz) ** 2 > 1.0) continue;
           const x = cx + dx, y = cy + dy, z = cz + dz;
           if (!this.world.inBounds(x, y, z)) continue;
           if (this.world.get(x, y, z) === Material.ROCK) continue;
@@ -120,37 +125,112 @@ export class Blueprint {
         }
       }
     }
-
-    // Slots = the lowest one or two layers (the chamber floor) where brood
-    // rests or food is stacked.
+    // Slots = the chamber floor (lowest 1–2 layers) where brood/food rests.
     let minY = Infinity;
     for (const [, y] of cells) if (y < minY) minY = y;
     const slots = cells.filter(([, y]) => y <= minY + 1);
 
     const cellIdx = new Set(cells.map(([x, y, z]) => this._idx(x, y, z)));
-    const chamber = { type, cx, cy, cz, cells, slots, cellIdx };
+    const chamber = { type, cx, cy, cz, rx, ry, rz, cells, slots, cellIdx };
     this.chambers.push(chamber);
     return chamber;
   }
 
-  // Add the next chamber down the shaft, alternating sides. Returns the chamber
-  // or null if we've reached the digging floor (world saturation).
+  // Grow the nest organically: branch a new chamber off an existing one in a
+  // direction that spreads into open soil, so a thriving colony fills the tank
+  // with an elaborate, sprawling network. Returns the chamber, or null if there
+  // is nowhere left to dig (the nest has saturated the tank).
   addChamber(type) {
-    const deepest = this.chambers.reduce(
-      (m, c) => Math.min(m, c.cy),
-      this.surfaceY,
+    const cfg = this.cfg;
+    const W = this.world;
+    const rBase = cfg.chamberRX;
+    let best = null, bestScore = -Infinity;
+
+    // Branch only off chambers that are actually excavated (have an air cell),
+    // so new growth always connects to the live nest rather than a stranded plan.
+    const live = this.chambers.filter(
+      (c) => W.get(c.cx, c.cy, c.cz) === Material.AIR ||
+        c.cells.some(([x, y, z]) => W.get(x, y, z) === Material.AIR),
     );
-    const cy = deepest - this.cfg.chamberSpacingY;
-    if (cy - this.cfg.chamberRY < this.minDigY) return null; // hit bedrock zone
+    const pool = live.length ? live : this.chambers;
 
-    const side = this._sideToggle;
-    this._sideToggle *= -1;
-    const cx = this.entrance.x + side * this.cfg.branchReach;
-    const cz = this.entrance.z;
+    for (let i = 0; i < cfg.branchTries; i++) {
+      const parent = pool[(Math.random() * pool.length) | 0];
+      const ang = Math.random() * Math.PI * 2;
+      const len = cfg.chamberSpacingY * (0.85 + Math.random() * 0.9);
+      const down = cfg.downwardBias + Math.random() * (1 - cfg.downwardBias);
+      const out = Math.sqrt(Math.max(0, 1 - down * down));
+      const x = Math.round(parent.cx + Math.cos(ang) * out * len);
+      const z = Math.round(parent.cz + Math.sin(ang) * out * len);
+      const y = Math.round(parent.cy - down * len);
 
-    this._extendShaftTo(cy);
-    this._planTunnel(this.entrance.x, cy, this.entrance.z, cx, cy, cz);
-    return this._addChamberAt(cx, cy, cz, type);
+      if (x < rBase + 1 || x > W.sx - rBase - 2) continue;
+      if (z < rBase + 1 || z > W.sz - rBase - 2) continue;
+      if (y - cfg.chamberRY < this.minDigY) continue;
+      if (y > this.surfaceY - cfg.surfaceMargin) continue;
+
+      // Spread: prefer spots far from existing chambers (vertical distance
+      // weighted so chambers stack in layers rather than merging).
+      let minD = Infinity;
+      for (const c of this.chambers) {
+        const d = Math.hypot(c.cx - x, (c.cy - y) * 1.4, c.cz - z);
+        if (d < minD) minD = d;
+      }
+      if (minD < rBase * cfg.minSeparation) continue; // would overlap a chamber
+      const score = minD + Math.random() * 4;
+      if (score > bestScore) { bestScore = score; best = { parent, x, y, z }; }
+    }
+
+    if (!best) return null;
+    const v = cfg.chamberSizeVar;
+    const jitter = () => 1 + (Math.random() * 2 - 1) * v;
+    this._planWanderingTunnel(best.parent.cx, best.parent.cy, best.parent.cz, best.x, best.y, best.z);
+    return this._addChamberAt(
+      best.x, best.y, best.z, type,
+      Math.max(2, Math.round(cfg.chamberRX * jitter())),
+      Math.max(1, Math.round(cfg.chamberRY * jitter())),
+      Math.max(2, Math.round(cfg.chamberRZ * jitter())),
+    );
+  }
+
+  // Carve a 1-voxel corridor from (x0..) to (x1..) that wanders for an organic
+  // look instead of a straight line. Nudges around rock and clamps to bounds.
+  _planWanderingTunnel(x0, y0, z0, x1, y1, z1) {
+    const W = this.world;
+    let x = x0, y = y0, z = z0, guard = 0;
+    while ((x !== x1 || y !== y1 || z !== z1) && guard++ < 240) {
+      this._plan(x, y, z);
+      const dx = Math.sign(x1 - x), dy = Math.sign(y1 - y), dz = Math.sign(z1 - z);
+      let nx = x, ny = y, nz = z;
+      if (Math.random() < this.cfg.wanderChance) {
+        // a sideways meander step
+        const ax = (Math.random() * 3) | 0;
+        if (ax === 0) nx += Math.random() < 0.5 ? 1 : -1;
+        else if (ax === 1) ny += Math.random() < 0.5 ? 1 : -1;
+        else nz += Math.random() < 0.5 ? 1 : -1;
+      } else {
+        // step along the axis with the most distance left
+        const adx = Math.abs(x1 - x), ady = Math.abs(y1 - y), adz = Math.abs(z1 - z);
+        if (adx >= ady && adx >= adz) nx += dx;
+        else if (adz >= ady) nz += dz;
+        else ny += dy;
+      }
+      nx = Math.max(1, Math.min(W.sx - 2, nx));
+      ny = Math.max(1, Math.min(W.sy - 2, ny));
+      nz = Math.max(1, Math.min(W.sz - 2, nz));
+      // Route around rock with a single-axis detour so the corridor stays
+      // face-contiguous (a diagonal jump would strand the cells beyond it).
+      if (W.get(nx, ny, nz) === Material.ROCK) {
+        let routed = false;
+        for (const [ax, ay, az] of [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, -1, 0], [0, 1, 0]]) {
+          const tx = x + ax, ty = y + ay, tz = z + az;
+          if (W.inBounds(tx, ty, tz) && W.get(tx, ty, tz) !== Material.ROCK) { nx = tx; ny = ty; nz = tz; routed = true; break; }
+        }
+        if (!routed) break; // boxed in by rock; stop the corridor here
+      }
+      x = nx; y = ny; z = nz;
+    }
+    this._plan(x1, y1, z1);
   }
 
   // Carve an exploratory foraging gallery from the existing nest toward a
@@ -197,6 +277,34 @@ export class Blueprint {
 
   onDug(x, y, z) {
     this.pending.delete(this._idx(x, y, z));
+  }
+
+  // Drop planned cells that can't actually be reached from the entrance (e.g. a
+  // chamber whose corridor got boxed in by rock). Floods through air + still-
+  // planned soil; anything not connected is pruned so it can't clog expansion.
+  pruneStranded(start) {
+    const W = this.world;
+    const startK = this._idx(start[0], start[1], start[2]);
+    const reached = new Set([startK]);
+    const q = [start];
+    let h = 0;
+    const N = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+    while (h < q.length) {
+      const [x, y, z] = q[h++];
+      for (const [dx, dy, dz] of N) {
+        const nx = x + dx, ny = y + dy, nz = z + dz;
+        if (!W.inBounds(nx, ny, nz)) continue;
+        const k = this._idx(nx, ny, nz);
+        if (reached.has(k)) continue;
+        if (W.get(nx, ny, nz) === Material.AIR || this.pending.has(k)) {
+          reached.add(k);
+          q.push([nx, ny, nz]);
+        }
+      }
+    }
+    let pruned = 0;
+    for (const k of this.pending) if (!reached.has(k)) { this.pending.delete(k); pruned++; }
+    return pruned;
   }
 
   isPending(idx) {

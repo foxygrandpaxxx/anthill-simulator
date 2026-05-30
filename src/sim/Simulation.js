@@ -11,18 +11,26 @@ import { Blueprint } from "./Blueprint.js";
 
 export const DEFAULT_SIM_CONFIG = {
   simHz: 30,
-  maxAnts: 240,
-  maxBrood: 240,
+  maxAnts: 400,
+  maxBrood: 400,
   moveTicksPerCell: 4,
   digTicks: 12,
   harvestTicks: 10,
-  navCap: 16000, // max cells explored by the shared navigation flood
+  navCap: 20000, // max cells explored by the shared navigation flood
   navRefreshTicks: 18, // how often the shared flood is rebuilt
 
-  // Exploratory foraging tunnels (digging toward hidden buried food)
-  forageTunnelInterval: 60, // ticks between checks
-  forageTunnelReachableMin: 8, // only dig if fewer than this many food cells are reachable
-  forageTunnelMaxPending: 30, // don't pile on new digs while ants are still busy
+  // Digging energy & nest expansion. Every excavated voxel spends food (energy),
+  // so foraging fuels digging; the nest only sprawls when the colony is prosperous.
+  digEnergyCost: 0.35, // food spent per voxel excavated
+  expandInterval: 30, // ticks between expansion checks
+  expandSurplus: 18, // spare food (above reserves) needed to grow the nest
+  expandMaxPending: 90, // cap outstanding planned digging so it can't run away
+  pruneInterval: 150, // ticks between pruning unreachable stranded plan cells
+
+  // Surface food keeps trickling back so the tank has a carrying capacity
+  // instead of starving to zero.
+  foodRespawnInterval: 40, // ticks between new surface food drops
+  foodRespawnClusterSize: 6,
 
   // Founding
   foundingThreshold: 10, // stored food needed before the founder becomes queen
@@ -38,22 +46,27 @@ export const DEFAULT_SIM_CONFIG = {
   consumeWorker: 0.004,
   consumeLarva: 0.02,
   foodPerHarvest: 3, // food units gained per foraged item (a morsel feeds many)
+  // Spawned bugs (carcasses): ants chip them apart slowly for a big payoff.
+  carcassChipTicks: 30, // ticks to chip off one piece (slower than a forage)
+  carcassFoodValue: 9, // food gained per carcass voxel chipped
+  bugSize: 8, // roughly how long (in voxels) a spawned bug is
   eggCost: 1, // food spent to lay an egg
   layReserve: 5, // base food buffer the queen always keeps before laying
   broodBuffer: 2.0, // extra reserve required per existing brood (lay restraint)
   // A hard floor on the laying interval caps the growth rate so the colony
   // can't overshoot its food supply faster than the ~maturation feedback loop.
-  layIntervalBase: 5.0, // seconds between eggs at low food...
-  layIntervalMin: 2.5, // ...down to this when food is plentiful
-  layIntervalFoodScale: 0.03, // how strongly food shortens the interval
+  // Equilibrium colony size ≈ (eggs/sec) × lifespan. These give ~300+.
+  layIntervalBase: 3.5, // seconds between eggs at low food...
+  layIntervalMin: 1.1, // ...down to this when food is plentiful
+  layIntervalFoodScale: 0.04, // how strongly food shortens the interval
 
   // Brood development (seconds per stage)
-  eggSeconds: 6,
-  larvaSeconds: 12,
-  pupaSeconds: 8,
+  eggSeconds: 5,
+  larvaSeconds: 10,
+  pupaSeconds: 7,
 
   // Workers
-  lifespanSeconds: 240,
+  lifespanSeconds: 360,
 
   // Labor balance
   foragerFractionBase: 0.5,
@@ -309,7 +322,7 @@ export class Simulation {
     const queue = [start];
     let head = 0;
 
-    const foodTargets = [], digTargets = [], depositTargets = [];
+    const foodTargets = [], digTargets = [], depositTargets = [], carcassTargets = [];
     const maxT = 300;
     const rmin = cfg.depositRadiusMin, rmax = cfg.depositRadiusMax;
     const maxDepY = this.surfaceY + cfg.depositMaxHeight;
@@ -333,7 +346,9 @@ export class Simulation {
         if (!w.inBounds(nx, ny, nz)) continue;
         const m = w.get(nx, ny, nz);
         if (m === Material.AIR) continue;
-        if (m === Material.FOOD) {
+        if (m === Material.CARCASS) {
+          carcassTargets.push({ stand: [x, y, z], target: [nx, ny, nz] }); // always tracked (high value)
+        } else if (m === Material.FOOD) {
           if (foodTargets.length < maxT) foodTargets.push({ stand: [x, y, z], target: [nx, ny, nz] });
         } else if (digTargets.length < maxT && isDiggable(m) && this.blueprint.isPending(w.idx(nx, ny, nz))) {
           digTargets.push({ stand: [x, y, z], target: [nx, ny, nz] });
@@ -351,7 +366,7 @@ export class Simulation {
       }
     }
 
-    this.nav = { parent, foodTargets, digTargets, depositTargets };
+    this.nav = { parent, foodTargets, digTargets, depositTargets, carcassTargets };
     this.claimed = new Set();
   }
 
@@ -395,10 +410,14 @@ export class Simulation {
 
   planForage(ant) {
     if (!this.nav) return false;
+    const harvestGoal = (t) => ({ type: "forageHarvest", target: t.target });
+    // A spawned bug is a high-value prize — go for it first.
+    if (this.nav.carcassTargets.length &&
+      this._assignFromList(ant, this.nav.carcassTargets,
+        (t) => this.world.get(...t.target) === Material.CARCASS, harvestGoal)) return true;
     return this._assignFromList(
       ant, this.nav.foodTargets,
-      (t) => this.world.get(...t.target) === Material.FOOD,
-      (t) => ({ type: "forageHarvest", target: t.target }),
+      (t) => this.world.get(...t.target) === Material.FOOD, harvestGoal,
     );
   }
 
@@ -515,14 +534,17 @@ export class Simulation {
         this.world._dirty = true;
         this.blueprint.onDug(x, y, z);
         this.dugCount++;
+        this.storedFood = Math.max(0, this.storedFood - this.cfg.digEnergyCost); // digging burns energy
         ant.carrying = "dirt";
       }
     } else if (g.type === "harvest") {
       const [x, y, z] = g.target;
-      if (this.world.get(x, y, z) === Material.FOOD) {
+      const m = this.world.get(x, y, z);
+      if (m === Material.FOOD || m === Material.CARCASS) {
         this.world.set(x, y, z, Material.AIR);
         this.world._dirty = true;
-        this.naturalFoodRemaining--;
+        if (m === Material.FOOD) { this.naturalFoodRemaining--; ant.carryValue = this.cfg.foodPerHarvest; }
+        else { ant.carryValue = this.cfg.carcassFoodValue; } // a chunk of bug is worth a lot
         ant.carrying = "food";
       }
     }
@@ -539,8 +561,10 @@ export class Simulation {
       } else ant.goal = null;
     } else if (g.type === "forageHarvest") {
       const [x, y, z] = g.target;
-      if (this.world.get(x, y, z) === Material.FOOD) {
-        ant.actionTimer = this.cfg.harvestTicks;
+      const m = this.world.get(x, y, z);
+      if (m === Material.FOOD || m === Material.CARCASS) {
+        // Chipping a bug carcass takes much longer than picking up a morsel.
+        ant.actionTimer = m === Material.CARCASS ? this.cfg.carcassChipTicks : this.cfg.harvestTicks;
         ant.actionGoal = { type: "harvest", target: g.target };
       } else ant.goal = null;
     } else if (g.type === "depositDirt") {
@@ -554,7 +578,8 @@ export class Simulation {
       }
       ant.goal = null;
     } else if (g.type === "forageDeposit") {
-      this.storedFood += this.cfg.foodPerHarvest;
+      this.storedFood += ant.carryValue || this.cfg.foodPerHarvest;
+      ant.carryValue = 0;
       ant.carrying = null;
       ant.task = null;
       ant.goal = null;
@@ -739,56 +764,78 @@ export class Simulation {
     this.ants = survivors;
   }
 
+  // Grow the nest. Two drivers, both gated by *energy* (spare food) so the nest
+  // only sprawls when the colony is prosperous and digging is affordable:
+  //  - need: add nursery/storage when brood/food approach capacity
+  //  - ambition: when there's surplus, keep branching out to fill the tank
   updateGrowth() {
-    if (this.tick % 30 !== 0) return;
+    if (this.tick % this.cfg.expandInterval !== 0) return;
+    if (!this.queen || this.saturated) return;
     const bp = this.blueprint;
+    if (bp.pending.size > this.cfg.expandMaxPending) return; // still plenty to dig
 
-    // Need nursery space? Plan ahead when brood approaches planned capacity.
-    const nurseryCap = bp.plannedCapacity("nursery");
-    if (this.queen && this.brood.length >= nurseryCap - 2) {
-      if (bp.addChamber("nursery") === null) this.saturated = true;
-      return;
-    }
+    const reserve = this.cfg.layReserve + this.ants.length * 0.5;
+    const surplus = this.storedFood - reserve;
+    if (surplus < this.cfg.expandSurplus) return; // not enough energy to dig
 
-    // Need storage? Plan ahead when stored food approaches planned capacity.
-    const storageCap = bp.plannedCapacity("storage");
-    if (Math.floor(this.storedFood) >= Math.max(3, storageCap - 1)) {
-      if (bp.addChamber("storage") === null) this.saturated = true;
-    }
+    const needNursery = this.brood.length >= bp.plannedCapacity("nursery") - 2;
+    const needStorage = Math.floor(this.storedFood) >= bp.plannedCapacity("storage") - 1;
+    let type;
+    if (needNursery) type = "nursery";
+    else if (needStorage) type = "storage";
+    else type = Math.random() < 0.55 ? "nursery" : "storage"; // ambition: fill the tank
+    if (bp.addChamber(type) === null) this.saturated = true;
   }
 
-  // When reachable food gets scarce, bore an exploratory gallery toward the
-  // nearest buried food so the colony keeps "finding" hidden deposits instead
-  // of stalling on its initially-reachable supply.
-  maybeForageTunnel() {
-    const cfg = this.cfg;
-    if (this.tick % cfg.forageTunnelInterval !== 0) return;
-    if (this.naturalFoodRemaining <= 0) return;
-    if (this.blueprint.pending.size > cfg.forageTunnelMaxPending) return; // ants still busy
-    const reachable = this.nav ? this.nav.foodTargets.length : 0;
-    if (reachable > cfg.forageTunnelReachableMin) return; // plenty within reach already
-
-    const target = this.findNearestBuriedFood();
-    if (target) this.blueprint.addForagingTunnel(target);
+  // Trickle of new surface food so the tank has a steady carrying capacity.
+  maybeRespawnFood() {
+    if (this.tick % this.cfg.foodRespawnInterval !== 0) return;
+    this.spawnSurfaceFoodCluster(this.cfg.foodRespawnClusterSize);
   }
 
-  // Nearest FOOD voxel to the nest that is still buried (no air neighbour).
-  findNearestBuriedFood() {
+  // Drop a small cluster of food on the surface at a random location.
+  spawnSurfaceFoodCluster(size) {
     const w = this.world;
-    const c = this.blueprint.nestCenter();
-    let best = null, bestD = Infinity;
-    for (let i = 0; i < w.voxels.length; i++) {
-      if (w.voxels[i] !== Material.FOOD) continue;
-      const [x, y, z] = this.decode(i);
-      let buried = true;
-      for (const [dx, dy, dz] of FACE6) {
-        if (w.get(x + dx, y + dy, z + dz) === Material.AIR) { buried = false; break; }
+    const cx = 3 + ((Math.random() * (w.sx - 6)) | 0);
+    const cz = 3 + ((Math.random() * (w.sz - 6)) | 0);
+    const n = 1 + ((Math.random() * size) | 0);
+    for (let k = 0; k < n; k++) {
+      const x = Math.max(0, Math.min(w.sx - 1, cx + ((Math.random() - 0.5) * 5) | 0));
+      const z = Math.max(0, Math.min(w.sz - 1, cz + ((Math.random() - 0.5) * 5) | 0));
+      const top = this.surfaceYAt(x, z);
+      if (top >= 0 && top + 1 < w.sy && w.get(x, top + 1, z) === Material.AIR) {
+        w.set(x, top + 1, z, Material.FOOD);
+        w._dirty = true;
+        this.naturalFoodRemaining++;
       }
-      if (!buried) continue;
-      const d = Math.abs(x - c.x) + Math.abs(y - c.y) + Math.abs(z - c.z);
-      if (d < bestD) { bestD = d; best = [x, y, z]; }
     }
-    return best;
+  }
+
+  // Spawn a "bug" (beetle/grasshopper) carcass on the surface: a clump of
+  // high-value CARCASS voxels the ants must swarm and chip apart over time.
+  spawnBug() {
+    const w = this.world;
+    // Land it within foraging range of the entrance so the colony actually
+    // discovers it (and reacts to it), but still somewhat random.
+    const R = 22;
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    const cx = clamp(this.entrance.x + Math.round((Math.random() - 0.5) * 2 * R), 4, w.sx - 5);
+    const cz = clamp(this.entrance.z + Math.round((Math.random() - 0.5) * 2 * R), 4, w.sz - 5);
+    const top = this.surfaceYAt(cx, cz);
+    if (top < 0 || top + 1 >= w.sy) return false;
+    // a short elongated body so it reads as a bug, sitting on the surface
+    const len = this.cfg.bugSize;
+    let placed = 0;
+    for (let i = 0; i < len; i++) {
+      const x = Math.max(0, Math.min(w.sx - 1, cx + i - ((len / 2) | 0)));
+      const ty = this.surfaceYAt(x, cz);
+      for (const dz of [0, i === 0 || i === len - 1 ? 0 : (Math.random() < 0.5 ? 1 : -1)]) {
+        const z = Math.max(0, Math.min(w.sz - 1, cz + dz));
+        if (w.get(x, ty + 1, z) === Material.AIR) { w.set(x, ty + 1, z, Material.CARCASS); placed++; }
+      }
+    }
+    if (placed) w._dirty = true;
+    return placed > 0;
   }
 
   reconcileFoodVoxels() {
@@ -843,7 +890,10 @@ export class Simulation {
     this.updateConsumption();
     this.updateAging();
     this.updateGrowth();
-    this.maybeForageTunnel();
+    if (this.tick % this.cfg.pruneInterval === 0) {
+      this.blueprint.pruneStranded([this.entrance.x, this.entrance.y, this.entrance.z]);
+    }
+    this.maybeRespawnFood();
     this.reconcileFoodVoxels();
     for (const ant of this.ants) this.stepAnt(ant);
   }
@@ -861,6 +911,7 @@ function makeAnt(id, x, y, z, role) {
     actionTimer: 0,
     actionGoal: null,
     carrying: null, // null | 'dirt' | 'food'
+    carryValue: 0, // food units in the currently-carried load
     task: null, // null | 'dig' | 'forage'
     idle: 0,
     age: 0,
