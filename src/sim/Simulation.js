@@ -19,6 +19,11 @@ export const DEFAULT_SIM_CONFIG = {
   navCap: 16000, // max cells explored by the shared navigation flood
   navRefreshTicks: 18, // how often the shared flood is rebuilt
 
+  // Exploratory foraging tunnels (digging toward hidden buried food)
+  forageTunnelInterval: 60, // ticks between checks
+  forageTunnelReachableMin: 8, // only dig if fewer than this many food cells are reachable
+  forageTunnelMaxPending: 30, // don't pile on new digs while ants are still busy
+
   // Founding
   foundingThreshold: 10, // stored food needed before the founder becomes queen
   foundingMinNurserySlots: 4, // nursery slots dug before the founder may transform
@@ -752,6 +757,40 @@ export class Simulation {
     }
   }
 
+  // When reachable food gets scarce, bore an exploratory gallery toward the
+  // nearest buried food so the colony keeps "finding" hidden deposits instead
+  // of stalling on its initially-reachable supply.
+  maybeForageTunnel() {
+    const cfg = this.cfg;
+    if (this.tick % cfg.forageTunnelInterval !== 0) return;
+    if (this.naturalFoodRemaining <= 0) return;
+    if (this.blueprint.pending.size > cfg.forageTunnelMaxPending) return; // ants still busy
+    const reachable = this.nav ? this.nav.foodTargets.length : 0;
+    if (reachable > cfg.forageTunnelReachableMin) return; // plenty within reach already
+
+    const target = this.findNearestBuriedFood();
+    if (target) this.blueprint.addForagingTunnel(target);
+  }
+
+  // Nearest FOOD voxel to the nest that is still buried (no air neighbour).
+  findNearestBuriedFood() {
+    const w = this.world;
+    const c = this.blueprint.nestCenter();
+    let best = null, bestD = Infinity;
+    for (let i = 0; i < w.voxels.length; i++) {
+      if (w.voxels[i] !== Material.FOOD) continue;
+      const [x, y, z] = this.decode(i);
+      let buried = true;
+      for (const [dx, dy, dz] of FACE6) {
+        if (w.get(x + dx, y + dy, z + dz) === Material.AIR) { buried = false; break; }
+      }
+      if (!buried) continue;
+      const d = Math.abs(x - c.x) + Math.abs(y - c.y) + Math.abs(z - c.z);
+      if (d < bestD) { bestD = d; best = [x, y, z]; }
+    }
+    return best;
+  }
+
   reconcileFoodVoxels() {
     if (this.tick % 5 !== 0) return;
     const bp = this.blueprint;
@@ -804,6 +843,7 @@ export class Simulation {
     this.updateConsumption();
     this.updateAging();
     this.updateGrowth();
+    this.maybeForageTunnel();
     this.reconcileFoodVoxels();
     for (const ant of this.ants) this.stepAnt(ant);
   }

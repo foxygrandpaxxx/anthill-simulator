@@ -1,6 +1,60 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { mergeGeometries } from "three/addons/utils/BufferGeometryUtils.js";
 import { buildMesh } from "./mesher.js";
+
+// --- Procedural insect geometry (built from boxes, merged) -----------------
+// All models face +X (forward), so an instance's heading is a rotation about Y.
+const _m4 = new THREE.Matrix4();
+const _q = new THREE.Quaternion();
+const _e = new THREE.Euler();
+const _one = new THREE.Vector3(1, 1, 1);
+const _pos = new THREE.Vector3();
+
+function part(w, h, d, x, y, z, rx = 0, ry = 0, rz = 0) {
+  const g = new THREE.BoxGeometry(w, h, d);
+  _e.set(rx, ry, rz);
+  _q.setFromEuler(_e);
+  _pos.set(x, y, z);
+  _m4.compose(_pos, _q, _one);
+  g.applyMatrix4(_m4);
+  return g;
+}
+
+// A worker ant: gaster, petiole, thorax, head, mandibles, antennae, 6 legs.
+function makeAntGeometry() {
+  const p = [
+    part(0.60, 0.46, 0.46, -0.45, 0.00, 0),   // gaster (abdomen)
+    part(0.16, 0.14, 0.14, -0.10, 0.01, 0),   // petiole (waist)
+    part(0.42, 0.38, 0.42, 0.18, 0.03, 0),    // thorax
+    part(0.34, 0.36, 0.44, 0.52, 0.05, 0),    // head
+    part(0.18, 0.07, 0.07, 0.74, 0.00, 0.10, 0, -0.5, 0), // mandible R
+    part(0.18, 0.07, 0.07, 0.74, 0.00, -0.10, 0, 0.5, 0), // mandible L
+    part(0.34, 0.05, 0.05, 0.80, 0.22, 0.12, 0, 0.6, 0.35), // antenna R
+    part(0.34, 0.05, 0.05, 0.80, 0.22, -0.12, 0, -0.6, 0.35), // antenna L
+  ];
+  // 3 leg-bars through the body read as 6 legs and can't look broken from any angle.
+  for (const lx of [0.34, 0.16, -0.02]) p.push(part(0.07, 0.07, 0.62, lx, -0.10, 0));
+  const g = mergeGeometries(p, false);
+  p.forEach((x) => x.dispose());
+  return g;
+}
+
+// The queen: same body plan, scaled up with a large egg-laden gaster.
+function makeQueenGeometry() {
+  const p = [
+    part(1.15, 0.82, 0.82, -0.70, 0.00, 0),   // big gaster
+    part(0.24, 0.22, 0.22, -0.05, 0.02, 0),   // petiole
+    part(0.58, 0.52, 0.58, 0.38, 0.06, 0),    // thorax
+    part(0.46, 0.48, 0.58, 0.82, 0.10, 0),    // head
+    part(0.42, 0.07, 0.07, 1.10, 0.32, 0.18, 0, 0.6, 0.35),
+    part(0.42, 0.07, 0.07, 1.10, 0.32, -0.18, 0, -0.6, 0.35),
+  ];
+  for (const lx of [0.50, 0.28, 0.06]) p.push(part(0.10, 0.10, 1.0, lx, -0.14, 0));
+  const g = mergeGeometries(p, false);
+  p.forEach((x) => x.dispose());
+  return g;
+}
 
 // Owns the Three.js scene, camera, lights and the world mesh.
 // Read-only with respect to the world model.
@@ -86,29 +140,29 @@ export class Renderer {
     this.maxAnts = maxAnts;
     this.maxBrood = maxBrood;
 
-    const antMat = new THREE.MeshStandardMaterial({ color: 0x241310, roughness: 0.5, metalness: 0.1 });
-    this.antMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(0.85, 0.65, 1.3), antMat, maxAnts);
+    const antMat = new THREE.MeshStandardMaterial({ color: 0x2a1812, roughness: 0.45, metalness: 0.15 });
+    this.antMesh = new THREE.InstancedMesh(makeAntGeometry(), antMat, maxAnts);
     this.antMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.antMesh.frustumCulled = false;
     this.worldGroup.add(this.antMesh);
 
     // Carried load — per-instance color (brown dirt vs gold food).
     const loadMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.9 });
-    this.loadMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(0.5, 0.5, 0.5), loadMat, maxAnts);
+    this.loadMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(0.42, 0.42, 0.42), loadMat, maxAnts);
     this.loadMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.loadMesh.frustumCulled = false;
     this.worldGroup.add(this.loadMesh);
 
-    // Brood — per-instance color/scale by stage.
-    const broodMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.8 });
-    this.broodMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), broodMat, maxBrood);
+    // Brood — rounded (sphere) with per-instance color/scale by stage.
+    const broodMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.7 });
+    this.broodMesh = new THREE.InstancedMesh(new THREE.SphereGeometry(0.5, 8, 6), broodMat, maxBrood);
     this.broodMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.broodMesh.frustumCulled = false;
     this.worldGroup.add(this.broodMesh);
 
-    // Queen — a single larger reddish body.
-    const queenMat = new THREE.MeshStandardMaterial({ color: 0x6b1f1f, roughness: 0.5, metalness: 0.15 });
-    this.queenMesh = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.8, 1.7), queenMat);
+    // Queen — a large, distinct reddish ant.
+    const queenMat = new THREE.MeshStandardMaterial({ color: 0x6e1f1f, roughness: 0.45, metalness: 0.2 });
+    this.queenMesh = new THREE.Mesh(makeQueenGeometry(), queenMat);
     this.queenMesh.visible = false;
     this.worldGroup.add(this.queenMesh);
 
@@ -164,6 +218,7 @@ export class Renderer {
     const removed = this._cutTest(cut);
     const d = this._dummy;
     const col = this._color;
+    const now = performance.now() * 0.001;
 
     // Ants + carried loads.
     const ants = sim.ants;
@@ -176,13 +231,23 @@ export class Renderer {
         const z = a.pz + (a.z - a.pz) * t + 0.5;
         const hidden = removed(a.x, a.y, a.z);
 
-        d.position.set(x, y, z);
+        // Face the direction of travel; keep the last heading when stationary.
+        if (a.x !== a.px || a.z !== a.pz) a._heading = Math.atan2(-(a.z - a.pz), a.x - a.px);
+        const heading = a._heading || 0;
+        // Scuttle: a quick bob + slight yaw waggle while the ant is active.
+        const active = a.x !== a.px || a.z !== a.pz || a.moveCounter > 0 || a.actionTimer > 0;
+        const ph = now * 9 + a.id * 1.7;
+        const bob = active ? Math.abs(Math.sin(ph)) * 0.1 : 0;
+        const waggle = active ? Math.sin(ph * 0.5) * 0.12 : 0;
+
+        d.position.set(x, y + bob, z);
+        d.rotation.set(0, heading + waggle, 0);
         d.scale.setScalar(hidden ? 0 : 1);
-        d.rotation.set(0, 0, 0);
         d.updateMatrix();
         this.antMesh.setMatrixAt(i, d.matrix);
 
-        d.position.set(x, y + 0.55, z);
+        d.position.set(x, y + 0.4, z);
+        d.rotation.set(0, 0, 0);
         d.scale.setScalar(a.carrying && !hidden ? 1 : 0);
         d.updateMatrix();
         this.loadMesh.setMatrixAt(i, d.matrix);
@@ -198,21 +263,22 @@ export class Renderer {
     this.loadMesh.instanceMatrix.needsUpdate = true;
     if (this.loadMesh.instanceColor) this.loadMesh.instanceColor.needsUpdate = true;
 
-    // Brood.
+    // Brood — eggs are small & round, larvae elongated grubs, pupae fat cocoons.
     const brood = sim.brood;
     const STAGE = {
-      egg: { s: 0.28, hex: 0xeae6d8 },
-      larva: { s: 0.42, hex: 0xf0e2b0 },
-      pupa: { s: 0.52, hex: 0xcdb98a },
+      egg: { sx: 0.30, sy: 0.30, sz: 0.30, hex: 0xeae6d8 },
+      larva: { sx: 0.62, sy: 0.34, sz: 0.34, hex: 0xf0e2b0 },
+      pupa: { sx: 0.54, sy: 0.42, sz: 0.42, hex: 0xcdb98a },
     };
     for (let i = 0; i < this.maxBrood; i++) {
       if (i < brood.length) {
         const b = brood[i];
         const st = STAGE[b.stage];
         const hidden = removed(b.x, b.y, b.z);
-        d.position.set(b.x + 0.5, b.y + 0.35, b.z + 0.5);
-        d.scale.setScalar(hidden ? 0 : st.s);
-        d.rotation.set(0, 0, 0);
+        d.position.set(b.x + 0.5, b.y + 0.3, b.z + 0.5);
+        if (hidden) d.scale.setScalar(0);
+        else d.scale.set(st.sx, st.sy, st.sz);
+        d.rotation.set(0, (b.idx % 6) * 1.04, 0); // a little orientation variety
         d.updateMatrix();
         this.broodMesh.setMatrixAt(i, d.matrix);
         col.setHex(st.hex);
@@ -225,12 +291,15 @@ export class Renderer {
     this.broodMesh.instanceMatrix.needsUpdate = true;
     if (this.broodMesh.instanceColor) this.broodMesh.instanceColor.needsUpdate = true;
 
-    // Queen.
+    // Queen — stationary, with a slow breathing motion.
     if (sim.queen) {
       const q = sim.queen;
       const hidden = removed(q.x, q.y, q.z);
       this.queenMesh.visible = !hidden;
-      this.queenMesh.position.set(q.x + 0.5, q.y + 0.4, q.z + 0.5);
+      const breathe = Math.sin(now * 2) * 0.025;
+      this.queenMesh.position.set(q.x + 0.5, q.y + 0.2 + breathe, q.z + 0.5);
+      if (q._heading == null) q._heading = Math.PI * 0.2;
+      this.queenMesh.rotation.y = q._heading;
     } else {
       this.queenMesh.visible = false;
     }

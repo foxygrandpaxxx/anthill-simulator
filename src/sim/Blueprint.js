@@ -153,6 +153,48 @@ export class Blueprint {
     return this._addChamberAt(cx, cy, cz, type);
   }
 
+  // Carve an exploratory foraging gallery from the existing nest toward a
+  // (usually hidden) target — e.g. a buried food deposit. The tunnel starts at
+  // whichever existing chamber is closest to the target and bores toward it,
+  // exposing the soil (and any food) it passes through. Returns true if planned.
+  addForagingTunnel(target) {
+    const w = this.world;
+    const c = this.nestCenter();
+    const before = this.pending.size;
+
+    // Carve from the food back toward the nest, planning the solid soil gap
+    // between them until we reach existing tunnels (air). This reliably exposes
+    // the deposit no matter how the nest happens to be shaped.
+    let x = target[0], y = target[1], z = target[2];
+    let guard = 0;
+    while (guard++ < 80) {
+      const dx = Math.sign(c.x - x), dy = Math.sign(c.y - y), dz = Math.sign(c.z - z);
+      if (dx === 0 && dy === 0 && dz === 0) break;
+      const adx = Math.abs(c.x - x), ady = Math.abs(c.y - y), adz = Math.abs(c.z - z);
+      let nx = x, ny = y, nz = z;
+      if (adx >= ady && adx >= adz) nx += dx;
+      else if (adz >= ady) nz += dz;
+      else ny += dy;
+
+      let m = w.get(nx, ny, nz);
+      if (m === Material.ROCK) { // nudge around rock
+        if (dz !== 0 && w.get(x, y, z + dz) !== Material.ROCK) { nx = x; ny = y; nz = z + dz; }
+        else if (dx !== 0 && w.get(x + dx, y, z) !== Material.ROCK) { nx = x + dx; ny = y; nz = z; }
+        else break;
+        m = w.get(nx, ny, nz);
+      }
+      x = nx; y = ny; z = nz;
+      if (m === Material.AIR) break; // reached the existing nest
+      this._plan(x, y, z);
+    }
+
+    // Expose the deposit itself by planning its solid neighbours.
+    for (const [dx, dy, dz] of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) {
+      this._plan(target[0] + dx, target[1] + dy, target[2] + dz);
+    }
+    return this.pending.size > before;
+  }
+
   onDug(x, y, z) {
     this.pending.delete(this._idx(x, y, z));
   }
