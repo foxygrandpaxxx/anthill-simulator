@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Anthill Simulator — Phase 1: The Tank</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --panel-bg: rgba(20, 18, 16, 0.82);
+        --accent: #d9a441;
+      }
+      * { box-sizing: border-box; }
+      html, body { margin: 0; height: 100%; overflow: hidden; background: #0c0a09; }
+      body { font-family: system-ui, "Segoe UI", sans-serif; color: #e8e2da; }
+      #app { position: fixed; inset: 0; }
+      canvas { display: block; }
+
+      #panel {
+        position: absolute;
+        top: 16px;
+        left: 16px;
+        width: 260px;
+        padding: 16px 18px;
+        background: var(--panel-bg);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 10px;
+        backdrop-filter: blur(8px);
+        user-select: none;
+      }
+      #panel h1 {
+        margin: 0 0 2px;
+        font-size: 15px;
+        font-weight: 600;
+        letter-spacing: 0.2px;
+      }
+      #panel .sub {
+        margin: 0 0 14px;
+        font-size: 11px;
+        opacity: 0.55;
+      }
+      .row { margin-bottom: 14px; }
+      .row label {
+        display: flex;
+        justify-content: space-between;
+        font-size: 12px;
+        margin-bottom: 6px;
+        opacity: 0.85;
+      }
+      .row label .val { color: var(--accent); font-variant-numeric: tabular-nums; }
+      input[type="range"] { width: 100%; accent-color: var(--accent); }
+      .seg { display: flex; gap: 6px; }
+      .seg button {
+        flex: 1;
+        padding: 5px 0;
+        font-size: 12px;
+        color: #e8e2da;
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      .seg button.active { background: var(--accent); color: #1a1410; border-color: var(--accent); }
+      .btn {
+        width: 100%;
+        padding: 8px 0;
+        font-size: 12px;
+        color: #1a1410;
+        background: var(--accent);
+        border: none;
+        border-radius: 6px;
+        cursor: pointer;
+        font-weight: 600;
+      }
+      #phase {
+        margin-top: 14px;
+        padding-top: 12px;
+        border-top: 1px solid rgba(255, 255, 255, 0.08);
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--accent);
+      }
+      #stats {
+        margin-top: 6px;
+        font-size: 11px;
+        line-height: 1.6;
+        opacity: 0.7;
+        font-variant-numeric: tabular-nums;
+      }
+      .hint {
+        position: absolute;
+        bottom: 14px;
+        left: 16px;
+        font-size: 11px;
+        opacity: 0.4;
+      }
+
+      #tuningWrap {
+        margin-top: 14px;
+        padding-top: 10px;
+        border-top: 1px solid rgba(255, 255, 255, 0.08);
+      }
+      #tuningWrap summary {
+        cursor: pointer;
+        font-size: 12px;
+        opacity: 0.8;
+        user-select: none;
+      }
+      .trow { margin-top: 10px; }
+      .trow label {
+        display: flex;
+        justify-content: space-between;
+        font-size: 11px;
+        margin-bottom: 4px;
+        opacity: 0.8;
+      }
+      .trow label .val { color: var(--accent); font-variant-numeric: tabular-nums; }
+      .trow input[type="range"] { width: 100%; accent-color: var(--accent); }
+      .btn.ghost {
+        background: rgba(255, 255, 255, 0.06);
+        color: #e8e2da;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+      }
+      .btn.ghost.active { background: var(--accent); color: #1a1410; }
+
+      #inspect {
+        position: absolute;
+        top: 16px;
+        right: 16px;
+        width: 210px;
+        padding: 14px 16px;
+        background: var(--panel-bg);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 10px;
+        backdrop-filter: blur(8px);
+        font-size: 12px;
+        line-height: 1.7;
+        font-variant-numeric: tabular-nums;
+      }
+      #inspect.hidden { display: none; }
+      #inspect h2 {
+        margin: 0 0 8px;
+        font-size: 13px;
+        color: var(--accent);
+      }
+      #inspect .close {
+        float: right;
+        cursor: pointer;
+        opacity: 0.5;
+        font-weight: 700;
+      }
+      #inspect .k { opacity: 0.55; }
+    </style>
+  </head>
+  <body>
+    <div id="app"></div>
+
+    <div id="panel">
+      <h1>🐜 Anthill Simulator</h1>
+      <p class="sub">Phase 1 — The Tank</p>
+
+      <div class="row">
+        <label>Cutaway axis</label>
+        <div class="seg" id="axis">
+          <button data-axis="x">X</button>
+          <button data-axis="y">Y</button>
+          <button data-axis="z" class="active">Z</button>
+        </div>
+      </div>
+
+      <div class="row">
+        <label>Cutaway depth <span class="val" id="cutVal">100%</span></label>
+        <input type="range" id="cut" min="0" max="100" value="100" step="1" />
+      </div>
+
+      <div class="row">
+        <label>Speed <span class="val" id="speedVal">1×</span></label>
+        <div class="seg" id="speed">
+          <button data-mul="0">⏸</button>
+          <button data-mul="1" class="active">1×</button>
+          <button data-mul="4">4×</button>
+          <button data-mul="16">16×</button>
+        </div>
+      </div>
+
+      <div class="row">
+        <button class="btn" id="regen">↻ New colony</button>
+      </div>
+
+      <div id="phase"></div>
+      <div id="stats"></div>
+
+      <details id="tuningWrap">
+        <summary>⚙ Tuning</summary>
+        <div class="trow">
+          <label>Forage yield <span class="val" data-for="foodPerHarvest"></span></label>
+          <input type="range" data-cfg="foodPerHarvest" min="1" max="8" step="1" />
+        </div>
+        <div class="trow">
+          <label>Lay interval (s) <span class="val" data-for="layIntervalMin"></span></label>
+          <input type="range" data-cfg="layIntervalMin" min="1" max="8" step="0.5" />
+        </div>
+        <div class="trow">
+          <label>Worker lifespan (s) <span class="val" data-for="lifespanSeconds"></span></label>
+          <input type="range" data-cfg="lifespanSeconds" min="60" max="600" step="20" />
+        </div>
+        <div class="trow">
+          <label>Larva appetite <span class="val" data-for="consumeLarva"></span></label>
+          <input type="range" data-cfg="consumeLarva" min="0.005" max="0.06" step="0.005" />
+        </div>
+        <div class="trow">
+          <label>Ant speed <span class="val" data-for="moveTicksPerCell"></span></label>
+          <input type="range" data-cfg="moveTicksPerCell" min="2" max="8" step="1" data-invert="1" />
+        </div>
+        <div class="trow">
+          <button class="btn ghost" id="dropFood">🍃 Drop food: off</button>
+        </div>
+      </details>
+    </div>
+
+    <div id="inspect" class="hidden"></div>
+
+    <div class="hint">Drag to orbit · Scroll to zoom · Click an ant to inspect</div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
