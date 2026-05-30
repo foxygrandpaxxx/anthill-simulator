@@ -20,6 +20,7 @@ let world = null;
 let sim = null;
 let cutAxis = "z";
 let speed = 1;
+let xray = false;
 
 function axisSize(axis) {
   return axis === "x" ? world.sx : axis === "y" ? world.sy : world.sz;
@@ -57,6 +58,7 @@ function regenerate() {
   renderer.setWorld(world, currentCut());
   renderer.frameWorld(world);
   renderer.initColony(sim.cfg.maxAnts, sim.cfg.maxBrood);
+  renderer.setXray(xray); // keep X-ray state across regenerations
   applyTuning(); // re-apply any tuned values onto the fresh sim
   selected = null;
   document.getElementById("inspect").classList.add("hidden");
@@ -84,6 +86,14 @@ speedButtons.forEach((btn) => {
     speed = Number(btn.dataset.mul);
     speedVal.textContent = speed === 0 ? "paused" : `${speed}×`;
   });
+});
+
+const xrayBtn = document.getElementById("xray");
+xrayBtn.addEventListener("click", () => {
+  xray = !xray;
+  renderer.setXray(xray);
+  xrayBtn.classList.toggle("active", xray);
+  xrayBtn.textContent = `👁 X-ray: ${xray ? "on" : "off"}`;
 });
 
 regenBtn.addEventListener("click", regenerate);

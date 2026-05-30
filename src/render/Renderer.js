@@ -59,6 +59,10 @@ export class Renderer {
     this.maxAnts = 0;
     this.maxBrood = 0;
 
+    // X-ray view: soil goes mostly transparent so the whole nest is visible.
+    this._xray = false;
+    this.xrayOpacity = 0.2;
+
     // Picking (click-to-inspect, drop-food).
     this._ray = new THREE.Raycaster();
     this._pointer = new THREE.Vector2();
@@ -107,6 +111,42 @@ export class Renderer {
     this.queenMesh = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.8, 1.7), queenMat);
     this.queenMesh.visible = false;
     this.worldGroup.add(this.queenMesh);
+
+    this._applyXray(); // re-apply current X-ray state to the fresh meshes
+  }
+
+  // Toggle X-ray: soil becomes mostly transparent and stops occluding, so the
+  // entire tunnel network and its colonists are visible at once. Colonists are
+  // boosted (always-draw + emissive glow) so they pop through the glassy soil.
+  setXray(on) {
+    this._xray = on;
+    this._applyXray();
+  }
+
+  _applyXray() {
+    const on = this._xray;
+    const m = this.material;
+    m.transparent = on;
+    m.opacity = on ? this.xrayOpacity : 1;
+    m.depthWrite = !on; // don't occlude the colonists when see-through
+    // A warm self-illumination so the translucent soil reads as glowing glass
+    // rather than going murky-dark over the near-black background.
+    m.emissive.setHex(on ? 0x3a2a18 : 0x000000);
+    m.needsUpdate = true;
+
+    const glow = (mesh, hex) => {
+      if (!mesh) return;
+      mesh.material.depthTest = !on; // colonists always draw over the glassy soil
+      mesh.renderOrder = on ? 10 : 0;
+      if (mesh.material.emissive) {
+        mesh.material.emissive.setHex(on ? hex : 0x000000);
+        mesh.material.needsUpdate = true;
+      }
+    };
+    glow(this.antMesh, 0x553219);
+    glow(this.loadMesh, 0x000000);
+    glow(this.broodMesh, 0x4a4530);
+    glow(this.queenMesh, 0x7a1c1c);
   }
 
   _cutTest(cut) {
