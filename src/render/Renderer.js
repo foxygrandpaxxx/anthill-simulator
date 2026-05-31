@@ -56,6 +56,22 @@ function makeQueenGeometry() {
   return g;
 }
 
+// A predator: a chunky spider — abdomen, cephalothorax, fangs, 8 splayed legs.
+function makeSpiderGeometry() {
+  const p = [
+    part(1.1, 0.8, 1.0, -0.55, 0.05, 0),   // abdomen
+    part(0.8, 0.6, 0.8, 0.35, 0.05, 0),    // cephalothorax
+    part(0.2, 0.2, 0.18, 0.78, -0.05, 0.16, 0, -0.4, 0), // fang R
+    part(0.2, 0.2, 0.18, 0.78, -0.05, -0.16, 0, 0.4, 0), // fang L
+  ];
+  for (const lx of [0.45, 0.18, -0.08, -0.32]) {
+    p.push(part(0.1, 0.1, 1.7, lx, -0.05, 0)); // a leg-bar through the body = 2 legs
+  }
+  const g = mergeGeometries(p, false);
+  p.forEach((x) => x.dispose());
+  return g;
+}
+
 // Owns the Three.js scene, camera, lights and the world mesh.
 // Read-only with respect to the world model.
 export class Renderer {
@@ -140,7 +156,8 @@ export class Renderer {
     this.maxAnts = maxAnts;
     this.maxBrood = maxBrood;
 
-    const antMat = new THREE.MeshStandardMaterial({ color: 0x2a1812, roughness: 0.45, metalness: 0.15 });
+    // White base so per-instance colour shows through (workers vs soldiers).
+    const antMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.45, metalness: 0.15 });
     this.antMesh = new THREE.InstancedMesh(makeAntGeometry(), antMat, maxAnts);
     this.antMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.antMesh.frustumCulled = false;
@@ -166,7 +183,32 @@ export class Renderer {
     this.queenMesh.visible = false;
     this.worldGroup.add(this.queenMesh);
 
+    // Predators (spiders) — a few at most.
+    this.maxPredators = 8;
+    const spiderMat = new THREE.MeshStandardMaterial({ color: 0x4a1212, roughness: 0.5, metalness: 0.2 });
+    this.predatorMesh = new THREE.InstancedMesh(makeSpiderGeometry(), spiderMat, this.maxPredators);
+    this.predatorMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.predatorMesh.frustumCulled = false;
+    this.worldGroup.add(this.predatorMesh);
+
+    // Pheromone trails — small additive glowing tiles on travelled cells.
+    this.maxPhero = 3000;
+    const pheroMat = new THREE.MeshBasicMaterial({
+      color: 0xffffff, transparent: true, opacity: 0.9,
+      blending: THREE.AdditiveBlending, depthWrite: false,
+    });
+    this.pheroMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(0.5, 0.12, 0.5), pheroMat, this.maxPhero);
+    this.pheroMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.pheroMesh.frustumCulled = false;
+    this.pheroMesh.visible = this._pheroVisible !== false;
+    this.worldGroup.add(this.pheroMesh);
+
     this._applyXray(); // re-apply current X-ray state to the fresh meshes
+  }
+
+  setPheromoneVisible(on) {
+    this._pheroVisible = on;
+    if (this.pheroMesh) this.pheroMesh.visible = on;
   }
 
   // Toggle X-ray: soil becomes mostly transparent and stops occluding, so the
@@ -201,6 +243,7 @@ export class Renderer {
     glow(this.loadMesh, 0x000000);
     glow(this.broodMesh, 0x4a4530);
     glow(this.queenMesh, 0x7a1c1c);
+    glow(this.predatorMesh, 0x661010);
   }
 
   _cutTest(cut) {
@@ -240,11 +283,15 @@ export class Renderer {
         const bob = active ? Math.abs(Math.sin(ph)) * 0.1 : 0;
         const waggle = active ? Math.sin(ph * 0.5) * 0.12 : 0;
 
+        // Soldiers are bigger and reddish; workers/founder are dark brown.
+        const soldier = a.role === "soldier";
         d.position.set(x, y + bob, z);
         d.rotation.set(0, heading + waggle, 0);
-        d.scale.setScalar(hidden ? 0 : 1);
+        d.scale.setScalar(hidden ? 0 : (soldier ? 1.4 : 1));
         d.updateMatrix();
         this.antMesh.setMatrixAt(i, d.matrix);
+        col.setHex(soldier ? 0x7a241a : 0x2a1812);
+        this.antMesh.setColorAt(i, col);
 
         d.position.set(x, y + 0.4, z);
         d.rotation.set(0, 0, 0);
@@ -260,6 +307,7 @@ export class Renderer {
       }
     }
     this.antMesh.instanceMatrix.needsUpdate = true;
+    if (this.antMesh.instanceColor) this.antMesh.instanceColor.needsUpdate = true;
     this.loadMesh.instanceMatrix.needsUpdate = true;
     if (this.loadMesh.instanceColor) this.loadMesh.instanceColor.needsUpdate = true;
 
@@ -302,6 +350,51 @@ export class Renderer {
       this.queenMesh.rotation.y = q._heading;
     } else {
       this.queenMesh.visible = false;
+    }
+
+    // Predators (spiders).
+    const preds = sim.predators || [];
+    for (let i = 0; i < this.maxPredators; i++) {
+      if (i < preds.length) {
+        const p = preds[i];
+        const hidden = removed(p.x, p.y, p.z);
+        if (p.x !== p.px || p.z !== p.pz) p._heading = Math.atan2(-(p.z - p.pz), p.x - p.px);
+        d.position.set(p.x + 0.5, p.y + 0.4 + Math.abs(Math.sin(now * 6 + i)) * 0.08, p.z + 0.5);
+        d.rotation.set(0, p._heading || 0, 0);
+        d.scale.setScalar(hidden ? 0 : 1.3);
+        d.updateMatrix();
+        this.predatorMesh.setMatrixAt(i, d.matrix);
+      } else {
+        d.scale.setScalar(0); d.updateMatrix();
+        this.predatorMesh.setMatrixAt(i, d.matrix);
+      }
+    }
+    this.predatorMesh.instanceMatrix.needsUpdate = true;
+
+    // Pheromone trails — additive glowing tiles, brightness ∝ intensity.
+    // Only the active instances are drawn (via .count), so no clearing needed.
+    if (this.pheroMesh.visible) {
+      const max = sim.cfg.pheroMax || 6;
+      const { sx, sy } = sim.world;
+      let i = 0;
+      for (const [k, v] of sim.pheromone) {
+        if (i >= this.maxPhero) break;
+        if (v < 0.4) continue;
+        const x = k % sx, y = Math.floor(k / sx) % sy, z = Math.floor(k / (sx * sy));
+        if (removed(x, y, z)) continue;
+        const t = Math.min(1, v / max);
+        d.position.set(x + 0.5, y + 0.06, z + 0.5);
+        d.rotation.set(0, 0, 0);
+        d.scale.set(1, 1, 1);
+        d.updateMatrix();
+        this.pheroMesh.setMatrixAt(i, d.matrix);
+        col.setRGB(0.12 * t, 0.55 * t, 0.42 * t); // teal glow
+        this.pheroMesh.setColorAt(i, col);
+        i++;
+      }
+      this.pheroMesh.count = i;
+      this.pheroMesh.instanceMatrix.needsUpdate = true;
+      if (this.pheroMesh.instanceColor) this.pheroMesh.instanceColor.needsUpdate = true;
     }
   }
 

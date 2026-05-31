@@ -102,6 +102,20 @@ document.getElementById("spawnBug").addEventListener("click", () => {
   if (sim) sim.spawnBug();
 });
 
+document.getElementById("spawnPredator").addEventListener("click", () => {
+  if (sim) sim.spawnPredator();
+});
+
+let trails = true;
+const trailsBtn = document.getElementById("trails");
+trailsBtn.classList.add("active");
+trailsBtn.addEventListener("click", () => {
+  trails = !trails;
+  renderer.setPheromoneVisible(trails);
+  trailsBtn.classList.toggle("active", trails);
+  trailsBtn.textContent = `🟢 Trails: ${trails ? "on" : "off"}`;
+});
+
 // --- Live tuning: bind [data-cfg] sliders to sim.cfg ----------------------
 const tuningInputs = document.querySelectorAll("#tuningWrap input[data-cfg]");
 function fmtTuning(input) {

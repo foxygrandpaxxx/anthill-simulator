@@ -67,6 +67,7 @@ export const DEFAULT_SIM_CONFIG = {
 
   // Workers
   lifespanSeconds: 360,
+  soldierFraction: 0.12, // share of new workers that become (bigger) soldiers
 
   // Labor balance
   foragerFractionBase: 0.5,
@@ -74,6 +75,21 @@ export const DEFAULT_SIM_CONFIG = {
   lowFoodLevel: 6,
 
   depositAnchorRadius: 3, // how close to the nest a forager must get to drop food
+
+  // Pheromone trails (returning foragers lay scent that decays — purely a
+  // visual layer; movement still uses the shared nav).
+  pheroDeposit: 1.3, // added to a cell each step a food-laden forager passes
+  pheroMax: 6,
+  pheroDecay: 0.93, // multiplier applied every pheroDecayInterval ticks
+  pheroDecayInterval: 8,
+  pheroMinKeep: 0.15, // forget trails fainter than this
+
+  // Predator threat & defense
+  predatorHp: 220, // damage needed to kill one
+  predatorSpeedTicks: 5, // ticks per cell of movement (lower = faster)
+  predatorBite: 26, // ticks between kills when it's among ants
+  fightRecruitRadius: 10, // workers within this rush to fight; soldiers always do
+  antBite: 1, // damage one attacking ant deals per tick
 };
 
 // Face neighbors (6): used for support detection and face-adjacent digging.
@@ -118,6 +134,11 @@ export class Simulation {
 
     this.nav = null;
     this.claimed = new Set();
+
+    this.pheromone = new Map(); // cellIdx -> trail intensity
+    this.predators = []; // active threats
+    this.killedByPredator = 0;
+    this._nextPredatorId = 1;
 
     this._initFounderAndBlueprint();
     this.rebuildNav();
@@ -475,6 +496,12 @@ export class Simulation {
       this._planFailed(ant); return;
     }
 
+    // Defense: drop everything and rush a predator (soldiers always; nearby workers too).
+    if (this.predators.length && this._shouldFight(ant)) {
+      const p = this._nearestPredator(ant);
+      if (p && this.planFight(ant, p)) { ant.task = "fight"; return; }
+    }
+
     let want;
     if (needForage && needDig) {
       const frac = this.storedFood <= cfg.lowFoodLevel
@@ -553,6 +580,13 @@ export class Simulation {
 
   arriveAnt(ant) {
     const g = ant.goal;
+    if (g.type === "fight") {
+      // Hold in melee for a while (damage is resolved centrally), then
+      // re-evaluate so we chase the predator if it has moved.
+      ant.idle = 8;
+      ant.goal = null;
+      return;
+    }
     if (g.type === "dig") {
       const [x, y, z] = g.target;
       if (this.blueprint.isPending(this.world.idx(x, y, z)) && isDiggable(this.world.get(x, y, z))) {
@@ -629,6 +663,11 @@ export class Simulation {
       ant.x = next[0]; ant.y = next[1]; ant.z = next[2];
       ant.pathIdx++;
       ant.stuck = 0; // made progress; not trapped
+      // Returning foragers lay a scent trail (recruits others; renders as a path).
+      if (ant.carrying === "food") {
+        const k = this.world.idx(ant.x, ant.y, ant.z);
+        this.pheromone.set(k, Math.min(cfg.pheroMax, (this.pheromone.get(k) || 0) + cfg.pheroDeposit));
+      }
     }
   }
 
@@ -701,7 +740,8 @@ export class Simulation {
       }
       spawn = found || [this.entrance.x, this.entrance.y, this.entrance.z];
     }
-    const ant = makeAnt(this._nextId++, spawn[0], spawn[1], spawn[2], "worker");
+    const role = Math.random() < this.cfg.soldierFraction ? "soldier" : "worker";
+    const ant = makeAnt(this._nextId++, spawn[0], spawn[1], spawn[2], role);
     this.ants.push(ant);
     this.bornCount++;
   }
@@ -838,6 +878,123 @@ export class Simulation {
     return placed > 0;
   }
 
+  _spawnCarcassAt(cx, cy, cz) {
+    const w = this.world;
+    for (const [dx, dz] of [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1]]) {
+      const x = Math.max(0, Math.min(w.sx - 1, cx + dx));
+      const z = Math.max(0, Math.min(w.sz - 1, cz + dz));
+      const ty = this.surfaceYAt(x, z);
+      if (ty >= 0 && ty + 1 < w.sy && w.get(x, ty + 1, z) === Material.AIR) {
+        w.set(x, ty + 1, z, Material.CARCASS);
+      }
+    }
+    w._dirty = true;
+  }
+
+  // ---- pheromone trails --------------------------------------------------
+
+  decayPheromone() {
+    if (this.tick % this.cfg.pheroDecayInterval !== 0) return;
+    const d = this.cfg.pheroDecay, min = this.cfg.pheroMinKeep;
+    for (const [k, v] of this.pheromone) {
+      const nv = v * d;
+      if (nv < min) this.pheromone.delete(k);
+      else this.pheromone.set(k, nv);
+    }
+  }
+
+  // ---- predators & defense ----------------------------------------------
+
+  spawnPredator() {
+    const w = this.world;
+    const edge = (Math.random() * 4) | 0;
+    let x, z;
+    if (edge === 0) { x = 2; z = 2 + ((Math.random() * (w.sz - 4)) | 0); }
+    else if (edge === 1) { x = w.sx - 3; z = 2 + ((Math.random() * (w.sz - 4)) | 0); }
+    else if (edge === 2) { z = 2; x = 2 + ((Math.random() * (w.sx - 4)) | 0); }
+    else { z = w.sz - 3; x = 2 + ((Math.random() * (w.sx - 4)) | 0); }
+    const y = this.surfaceYAt(x, z) + 1;
+    this.predators.push({ id: this._nextPredatorId++, x, y, z, px: x, py: y, pz: z, hp: this.cfg.predatorHp, hpMax: this.cfg.predatorHp, moveTimer: 0, biteTimer: 0 });
+    return true;
+  }
+
+  _nearestPredator(a) {
+    let best = null, bestD = Infinity;
+    for (const p of this.predators) {
+      const d = Math.abs(a.x - p.x) + Math.abs(a.y - p.y) + Math.abs(a.z - p.z);
+      if (d < bestD) { bestD = d; best = p; }
+    }
+    return best;
+  }
+
+  _shouldFight(a) {
+    if (a.role === "soldier") return true; // soldiers always answer the alarm
+    const p = this._nearestPredator(a);
+    return p && Math.abs(a.x - p.x) + Math.abs(a.z - p.z) <= this.cfg.fightRecruitRadius;
+  }
+
+  planFight(ant, p) {
+    // Pick a (random) walkable cell around the predator so attackers spread out
+    // and surround it instead of all piling onto one spot.
+    const cands = [];
+    for (const [dx, dy, dz] of MOVE18) {
+      const c = [p.x + dx, p.y + dy, p.z + dz];
+      if (this.walkable(...c)) cands.push(c);
+    }
+    if (!cands.length) { const nw = this.nearestWalkable(p.x, p.y, p.z, 3); if (nw) cands.push(nw); }
+    if (!cands.length) return false;
+    const stand = cands[(Math.random() * cands.length) | 0];
+    const path = this.pathVia(ant, stand);
+    if (!path) return false;
+    ant.path = path; ant.pathIdx = 0; ant.goal = { type: "fight", pid: p.id };
+    return true;
+  }
+
+  updatePredators() {
+    if (!this.predators.length) return;
+    const cfg = this.cfg, w = this.world;
+    const survivors = [];
+    for (const p of this.predators) {
+      // crawl toward the nest entrance along the surface
+      if (++p.moveTimer >= cfg.predatorSpeedTicks) {
+        p.moveTimer = 0;
+        const dx = Math.sign(this.entrance.x - p.x), dz = Math.sign(this.entrance.z - p.z);
+        p.px = p.x; p.pz = p.z;
+        if (Math.abs(this.entrance.x - p.x) >= Math.abs(this.entrance.z - p.z)) p.x += dx; else p.z += dz;
+        p.x = Math.max(0, Math.min(w.sx - 1, p.x));
+        p.z = Math.max(0, Math.min(w.sz - 1, p.z));
+        // Stay up on the surface — don't crawl down into the entrance shaft.
+        p.py = p.y; p.y = Math.max(this.surfaceY - 1, this.surfaceYAt(p.x, p.z) + 1);
+      }
+      // ants in melee range chew on it (soldiers hit harder); it bites back
+      let dmg = 0, melee = 0;
+      for (const a of this.ants) {
+        if (Math.abs(a.x - p.x) <= 1 && Math.abs(a.y - p.y) <= 1 && Math.abs(a.z - p.z) <= 1) {
+          melee++;
+          dmg += a.role === "soldier" ? cfg.antBite * 2.5 : cfg.antBite;
+        }
+      }
+      p.hp -= dmg / cfg.simHz;
+      if (++p.biteTimer >= cfg.predatorBite && melee > 0) { p.biteTimer = 0; this._predatorKill(p); }
+      if (p.hp > 0) survivors.push(p);
+      else this._spawnCarcassAt(p.x, p.y - 1, p.z); // slain — its body feeds the colony
+    }
+    this.predators = survivors;
+  }
+
+  _predatorKill(p) {
+    // prefer to kill a non-soldier in range
+    let victim = -1;
+    for (let i = 0; i < this.ants.length; i++) {
+      const a = this.ants[i];
+      if (Math.abs(a.x - p.x) <= 1 && Math.abs(a.y - p.y) <= 1 && Math.abs(a.z - p.z) <= 1) {
+        if (a.role !== "soldier") { victim = i; break; }
+        if (victim < 0) victim = i;
+      }
+    }
+    if (victim >= 0) { this.ants.splice(victim, 1); this.deaths++; this.killedByPredator++; }
+  }
+
   reconcileFoodVoxels() {
     if (this.tick % 5 !== 0) return;
     const bp = this.blueprint;
@@ -895,6 +1052,8 @@ export class Simulation {
     }
     this.maybeRespawnFood();
     this.reconcileFoodVoxels();
+    this.updatePredators();
+    this.decayPheromone();
     for (const ant of this.ants) this.stepAnt(ant);
   }
 }
