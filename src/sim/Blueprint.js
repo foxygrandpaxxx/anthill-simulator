@@ -19,7 +19,7 @@ export const DEFAULT_BLUEPRINT_CONFIG = {
   bedrockMargin: 3, // stop digging this many voxels above the lowest soil
   surfaceMargin: 4, // keep chamber centres at least this far below the surface
   // Organic branching growth
-  branchTries: 14, // candidate placements considered per new chamber
+  branchTries: 20, // candidate placements considered per new chamber
   minSeparation: 1.7, // chamber spacing as a multiple of radius (no overlap)
   downwardBias: 0.45, // 0..1 how strongly new chambers tend deeper vs outward
   wanderChance: 0.22, // chance of a sideways "wander" step when carving tunnels
@@ -177,14 +177,27 @@ export class Blueprint {
         if (d < minD) minD = d;
       }
       if (minD < rBase * cfg.minSeparation) continue; // would overlap a chamber
-      const score = minD + Math.random() * 4;
+      // Prefer CLOSE placements: short corridors dig reliably, and the nest
+      // grows outward as a dense connected network rather than jumping to
+      // distant deep spots whose long tunnels strand.
+      const score = -minD + Math.random() * 3;
       if (score > bestScore) { bestScore = score; best = { parent, x, y, z }; }
     }
 
     if (!best) return null;
     const v = cfg.chamberSizeVar;
     const jitter = () => 1 + (Math.random() * 2 - 1) * v;
-    this._planWanderingTunnel(best.parent.cx, best.parent.cy, best.parent.cz, best.x, best.y, best.z);
+    // Start the corridor at an already-EXCAVATED cell of the parent nearest the
+    // target, so the new chamber's planned cells connect to real dug air and are
+    // actually reachable (not stranded behind undug rock/soil).
+    let start = [best.parent.cx, best.parent.cy, best.parent.cz];
+    let sBest = Infinity;
+    for (const [x, y, z] of best.parent.cells) {
+      if (this.world.get(x, y, z) !== Material.AIR) continue;
+      const d = Math.abs(x - best.x) + Math.abs(y - best.y) + Math.abs(z - best.z);
+      if (d < sBest) { sBest = d; start = [x, y, z]; }
+    }
+    this._planWanderingTunnel(start[0], start[1], start[2], best.x, best.y, best.z);
     return this._addChamberAt(
       best.x, best.y, best.z, type,
       Math.max(2, Math.round(cfg.chamberRX * jitter())),
@@ -304,7 +317,30 @@ export class Blueprint {
     }
     let pruned = 0;
     for (const k of this.pending) if (!reached.has(k)) { this.pending.delete(k); pruned++; }
+    this._removeDeadChambers();
     return pruned;
+  }
+
+  // Drop chambers that ended up with no live cells (none excavated and none
+  // still pending) — e.g. one whose corridor never connected — so capacity
+  // bookkeeping reflects what actually exists. The founding nursery is kept.
+  _removeDeadChambers() {
+    const kept = [];
+    for (let i = 0; i < this.chambers.length; i++) {
+      const c = this.chambers[i];
+      let live = i === 0;
+      if (!live) {
+        for (const [x, y, z] of c.cells) {
+          const m = this.world.get(x, y, z);
+          if (m === Material.AIR || m === Material.STORE || this.pending.has(this._idx(x, y, z))) { live = true; break; }
+        }
+      }
+      if (live) kept.push(c);
+    }
+    if (kept.length !== this.chambers.length) {
+      this.chambers = kept;
+      this._storeCellsAt = -1; // invalidate granary-cell cache
+    }
   }
 
   isPending(idx) {
@@ -319,6 +355,25 @@ export class Blueprint {
 
   chambersOfType(type) {
     return this.chambers.filter((c) => c.type === type);
+  }
+
+  // All cells of every storage chamber, sorted bottom-up so food piles fill
+  // from the floor. Cached and rebuilt whenever a chamber is added.
+  storageFillCells() {
+    if (this._storeCells && this._storeCellsAt === this.chambers.length) return this._storeCells;
+    const cells = [];
+    for (const c of this.chambersOfType("storage")) for (const cell of c.cells) cells.push(cell);
+    cells.sort((a, b) => a[1] - b[1]); // y ascending
+    this._storeCells = cells;
+    this._storeCellsAt = this.chambers.length;
+    return cells;
+  }
+
+  // Total planned granary cells (dug or not) — used to stop over-planning storage.
+  plannedStorageVoxels() {
+    let n = 0;
+    for (const c of this.chambersOfType("storage")) n += c.cells.length;
+    return n;
   }
 
   // Air slots (excavated and ready to use right now).

@@ -11,21 +11,30 @@ import { Blueprint } from "./Blueprint.js";
 
 export const DEFAULT_SIM_CONFIG = {
   simHz: 30,
-  maxAnts: 400,
-  maxBrood: 400,
+  maxAnts: 500,
+  maxBrood: 500,
   moveTicksPerCell: 4,
-  digTicks: 12,
+  digTicks: 9,
   harvestTicks: 10,
   navCap: 20000, // max cells explored by the shared navigation flood
   navRefreshTicks: 18, // how often the shared flood is rebuilt
 
   // Digging energy & nest expansion. Every excavated voxel spends food (energy),
   // so foraging fuels digging; the nest only sprawls when the colony is prosperous.
-  digEnergyCost: 0.35, // food spent per voxel excavated
-  expandInterval: 30, // ticks between expansion checks
-  expandSurplus: 18, // spare food (above reserves) needed to grow the nest
-  expandMaxPending: 90, // cap outstanding planned digging so it can't run away
+  digEnergyCost: 0.25, // food spent per voxel excavated
+  expandInterval: 24, // ticks between expansion checks
+  expandSurplus: 14, // spare food (above reserves) that prompts ambitious growth
+  expandMaxPending: 110, // cap outstanding planned digging so it can't run away
   pruneInterval: 150, // ticks between pruning unreachable stranded plan cells
+  minDigReserve: 6, // minimum stored food (energy) to start an expansion dig
+
+  // Physical food storage — food takes real space in granary chambers, so the
+  // nest must keep digging storage to hold more.
+  foodPerStoreVoxel: 4, // food units one STORE voxel represents
+  baseStorageCapacity: 35, // food the nest holds before any storage chamber exists
+  storagePerAnt: 6, // target granary capacity scales with colony size (extensive)
+  storageFullFrac: 0.8, // dig more storage once stored food hits this fraction of capacity
+  nurseryHeadroom: 3, // dig more nursery when free brood slots fall below this
 
   // Surface food keeps trickling back so the tank has a carrying capacity
   // instead of starving to zero.
@@ -56,9 +65,9 @@ export const DEFAULT_SIM_CONFIG = {
   // A hard floor on the laying interval caps the growth rate so the colony
   // can't overshoot its food supply faster than the ~maturation feedback loop.
   // Equilibrium colony size ≈ (eggs/sec) × lifespan. These give ~300+.
-  layIntervalBase: 3.5, // seconds between eggs at low food...
-  layIntervalMin: 1.1, // ...down to this when food is plentiful
-  layIntervalFoodScale: 0.04, // how strongly food shortens the interval
+  layIntervalBase: 3.0, // seconds between eggs at low food...
+  layIntervalMin: 0.85, // ...down to this when food is plentiful
+  layIntervalFoodScale: 0.05, // how strongly food shortens the interval
 
   // Brood development (seconds per stage)
   eggSeconds: 5,
@@ -124,6 +133,7 @@ export class Simulation {
 
     this.storedFood = 0; // float
     this.starveDebt = 0; // accumulates when food runs out, paces starvation deaths
+    this._storageCap = (config.baseStorageCapacity ?? DEFAULT_SIM_CONFIG.baseStorageCapacity); // physical food capacity
     this.naturalFoodRemaining = gen ? gen.naturalFood : 0;
 
     this.dugCount = 0;
@@ -504,9 +514,10 @@ export class Simulation {
 
     let want;
     if (needForage && needDig) {
-      const frac = this.storedFood <= cfg.lowFoodLevel
-        ? cfg.foragerFractionLowFood
-        : cfg.foragerFractionBase;
+      // Hungry → mostly forage; larder full → mostly dig (build more granaries).
+      let frac = cfg.foragerFractionBase;
+      if (this.storedFood <= cfg.lowFoodLevel) frac = cfg.foragerFractionLowFood;
+      else if (this.storedFood >= this._storageCap * 0.92) frac = 0.25;
       let foragers = 0;
       for (const a of this.ants) if (a.task === "forage") foragers++;
       want = foragers / Math.max(1, this.ants.length) < frac ? "forage" : "dig";
@@ -612,7 +623,8 @@ export class Simulation {
       }
       ant.goal = null;
     } else if (g.type === "forageDeposit") {
-      this.storedFood += ant.carryValue || this.cfg.foodPerHarvest;
+      // Stores are physically limited — a full larder can't hold more.
+      this.storedFood = Math.min(this._storageCap, this.storedFood + (ant.carryValue || this.cfg.foodPerHarvest));
       ant.carryValue = 0;
       ant.carrying = null;
       ant.task = null;
@@ -808,23 +820,33 @@ export class Simulation {
   // only sprawls when the colony is prosperous and digging is affordable:
   //  - need: add nursery/storage when brood/food approach capacity
   //  - ambition: when there's surplus, keep branching out to fill the tank
+  // Grow the nest when the colony physically needs room — more nursery for
+  // brood, more granaries for food — gated by a little dig energy. Both needs
+  // recur constantly as the colony grows, so the tunnels keep sprawling.
   updateGrowth() {
     if (this.tick % this.cfg.expandInterval !== 0) return;
     if (!this.queen || this.saturated) return;
-    const bp = this.blueprint;
-    if (bp.pending.size > this.cfg.expandMaxPending) return; // still plenty to dig
+    const cfg = this.cfg, bp = this.blueprint;
+    if (bp.pending.size > cfg.expandMaxPending) return; // still plenty to dig
+    if (this.storedFood < cfg.minDigReserve) return; // need a little energy
 
-    const reserve = this.cfg.layReserve + this.ants.length * 0.5;
-    const surplus = this.storedFood - reserve;
-    if (surplus < this.cfg.expandSurplus) return; // not enough energy to dig
+    const nurseryFull = this.freeNurserySlotCount() < cfg.nurseryHeadroom;
+    // Want more storage if the larder is filling AND we haven't already planned
+    // enough granary capacity for the current colony size (stops over-planning).
+    const desiredCap = cfg.baseStorageCapacity + this.ants.length * cfg.storagePerAnt;
+    const plannedCap = cfg.baseStorageCapacity + bp.plannedStorageVoxels() * cfg.foodPerStoreVoxel;
+    const storageFull = this.storedFood >= this._storageCap * cfg.storageFullFrac && plannedCap < desiredCap;
 
-    const needNursery = this.brood.length >= bp.plannedCapacity("nursery") - 2;
-    const needStorage = Math.floor(this.storedFood) >= bp.plannedCapacity("storage") - 1;
-    let type;
-    if (needNursery) type = "nursery";
-    else if (needStorage) type = "storage";
-    else type = Math.random() < 0.55 ? "nursery" : "storage"; // ambition: fill the tank
-    if (bp.addChamber(type) === null) this.saturated = true;
+    let type = null;
+    if (nurseryFull && storageFull) type = Math.random() < 0.5 ? "nursery" : "storage";
+    else if (nurseryFull) type = "nursery";
+    else if (storageFull) type = "storage";
+    else {
+      // Ambition: with a comfortable surplus, keep extending the network.
+      const surplus = this.storedFood - (cfg.layReserve + this.ants.length * 0.5);
+      if (surplus > cfg.expandSurplus) type = Math.random() < 0.5 ? "nursery" : "storage";
+    }
+    if (type && bp.addChamber(type) === null) this.saturated = true;
   }
 
   // Trickle of new surface food so the tank has a steady carrying capacity.
@@ -995,35 +1017,38 @@ export class Simulation {
     if (victim >= 0) { this.ants.splice(victim, 1); this.deaths++; this.killedByPredator++; }
   }
 
+  // Physically represent stored food as STORE voxels filling the granary
+  // chambers bottom-up, and recompute the colony's real storage capacity.
   reconcileFoodVoxels() {
     if (this.tick % 5 !== 0) return;
-    const bp = this.blueprint;
-    const slots = [];
-    for (const c of bp.chambersOfType("storage")) for (const s of c.slots) slots.push(s);
+    const w = this.world;
+    const cells = this.blueprint.storageFillCells(); // sorted floor→ceiling
 
-    let visible = 0;
-    for (const s of slots) if (this.world.get(s[0], s[1], s[2]) === Material.STORE) visible++;
-    const target = Math.min(Math.floor(this.storedFood), slots.length);
+    // Capacity = base buffer + every excavated granary cell.
+    let excavated = 0, visible = 0;
+    for (const c of cells) {
+      const m = w.get(c[0], c[1], c[2]);
+      if (m === Material.AIR || m === Material.STORE) excavated++;
+      if (m === Material.STORE) visible++;
+    }
+    this._storageCap = this.cfg.baseStorageCapacity + excavated * this.cfg.foodPerStoreVoxel;
+    if (this.storedFood > this._storageCap) this.storedFood = this._storageCap;
 
-    let budget = 6;
+    // Food beyond the abstract base buffer is shown as voxels in the granaries.
+    const target = Math.max(0, Math.floor((this.storedFood - this.cfg.baseStorageCapacity) / this.cfg.foodPerStoreVoxel));
+    let budget = 12;
     if (visible < target) {
-      for (const s of slots) {
-        if (budget <= 0) break;
-        if (this.world.get(s[0], s[1], s[2]) === Material.AIR) {
-          this.world.set(s[0], s[1], s[2], Material.STORE);
-          this.world._dirty = true;
-          budget--; visible++;
-          if (visible >= target) break;
+      for (const c of cells) {
+        if (budget <= 0 || visible >= target) break;
+        if (w.get(c[0], c[1], c[2]) === Material.AIR) {
+          w.set(c[0], c[1], c[2], Material.STORE); w._dirty = true; budget--; visible++;
         }
       }
     } else if (visible > target) {
-      for (let i = slots.length - 1; i >= 0 && budget > 0; i--) {
-        const s = slots[i];
-        if (this.world.get(s[0], s[1], s[2]) === Material.STORE) {
-          this.world.set(s[0], s[1], s[2], Material.AIR);
-          this.world._dirty = true;
-          budget--; visible--;
-          if (visible <= target) break;
+      for (let i = cells.length - 1; i >= 0 && budget > 0 && visible > target; i--) {
+        const c = cells[i];
+        if (w.get(c[0], c[1], c[2]) === Material.STORE) {
+          w.set(c[0], c[1], c[2], Material.AIR); w._dirty = true; budget--; visible--;
         }
       }
     }
