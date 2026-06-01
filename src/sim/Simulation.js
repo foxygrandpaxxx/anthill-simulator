@@ -24,7 +24,7 @@ export const DEFAULT_SIM_CONFIG = {
   digEnergyCost: 0.25, // food spent per voxel excavated
   expandInterval: 24, // ticks between expansion checks
   expandSurplus: 14, // spare food (above reserves) that prompts ambitious growth
-  expandMaxPending: 110, // cap outstanding planned digging so it can't run away
+  expandMaxPending: 10, // finish the current chamber+corridor before starting the next
   pruneInterval: 150, // ticks between pruning unreachable stranded plan cells
   minDigReserve: 6, // minimum stored food (energy) to start an expansion dig
 

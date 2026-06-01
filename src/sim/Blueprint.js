@@ -15,14 +15,13 @@ export const DEFAULT_BLUEPRINT_CONFIG = {
   chamberRX: 3, // horizontal radius (x)
   chamberRZ: 3, // horizontal radius (z)
   chamberRY: 2, // vertical radius (oblate: flatter than wide)
-  chamberSizeVar: 0.5, // ± fraction of random radius variation per chamber
+  chamberSizeVar: 0.28, // ± fraction of random radius variation per chamber
   bedrockMargin: 3, // stop digging this many voxels above the lowest soil
   surfaceMargin: 4, // keep chamber centres at least this far below the surface
-  // Organic branching growth
-  branchTries: 20, // candidate placements considered per new chamber
-  minSeparation: 1.7, // chamber spacing as a multiple of radius (no overlap)
+  // Branching growth — distinct round chambers joined by clean corridors.
+  branchTries: 22, // candidate placements considered per new chamber
+  minSeparation: 2.9, // min centre spacing (× radius) so chambers never overlap
   downwardBias: 0.45, // 0..1 how strongly new chambers tend deeper vs outward
-  wanderChance: 0.22, // chance of a sideways "wander" step when carving tunnels
 };
 
 export class Blueprint {
@@ -197,7 +196,7 @@ export class Blueprint {
       const d = Math.abs(x - best.x) + Math.abs(y - best.y) + Math.abs(z - best.z);
       if (d < sBest) { sBest = d; start = [x, y, z]; }
     }
-    this._planWanderingTunnel(start[0], start[1], start[2], best.x, best.y, best.z);
+    this._planCleanTunnel(start[0], start[1], start[2], best.x, best.y, best.z);
     return this._addChamberAt(
       best.x, best.y, best.z, type,
       Math.max(2, Math.round(cfg.chamberRX * jitter())),
@@ -206,42 +205,35 @@ export class Blueprint {
     );
   }
 
-  // Carve a 1-voxel corridor from (x0..) to (x1..) that wanders for an organic
-  // look instead of a straight line. Nudges around rock and clamps to bounds.
-  _planWanderingTunnel(x0, y0, z0, x1, y1, z1) {
+  // Carve a clean 1-voxel corridor from (x0..) to (x1..): a straight vertical
+  // run, then a straight run in x, then in z — orderly, face-contiguous, like
+  // real ant-nest tunnels. Detours minimally around rock.
+  _planCleanTunnel(x0, y0, z0, x1, y1, z1) {
     const W = this.world;
-    let x = x0, y = y0, z = z0, guard = 0;
-    while ((x !== x1 || y !== y1 || z !== z1) && guard++ < 240) {
-      this._plan(x, y, z);
-      const dx = Math.sign(x1 - x), dy = Math.sign(y1 - y), dz = Math.sign(z1 - z);
-      let nx = x, ny = y, nz = z;
-      if (Math.random() < this.cfg.wanderChance) {
-        // a sideways meander step
-        const ax = (Math.random() * 3) | 0;
-        if (ax === 0) nx += Math.random() < 0.5 ? 1 : -1;
-        else if (ax === 1) ny += Math.random() < 0.5 ? 1 : -1;
-        else nz += Math.random() < 0.5 ? 1 : -1;
-      } else {
-        // step along the axis with the most distance left
-        const adx = Math.abs(x1 - x), ady = Math.abs(y1 - y), adz = Math.abs(z1 - z);
-        if (adx >= ady && adx >= adz) nx += dx;
-        else if (adz >= ady) nz += dz;
-        else ny += dy;
-      }
-      nx = Math.max(1, Math.min(W.sx - 2, nx));
-      ny = Math.max(1, Math.min(W.sy - 2, ny));
-      nz = Math.max(1, Math.min(W.sz - 2, nz));
-      // Route around rock with a single-axis detour so the corridor stays
-      // face-contiguous (a diagonal jump would strand the cells beyond it).
-      if (W.get(nx, ny, nz) === Material.ROCK) {
-        let routed = false;
-        for (const [ax, ay, az] of [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, -1, 0], [0, 1, 0]]) {
-          const tx = x + ax, ty = y + ay, tz = z + az;
-          if (W.inBounds(tx, ty, tz) && W.get(tx, ty, tz) !== Material.ROCK) { nx = tx; ny = ty; nz = tz; routed = true; break; }
+    const cl = (v, hi) => Math.max(1, Math.min(hi, v));
+    let x = x0, y = y0, z = z0;
+    for (const axis of [1, 0, 2]) { // y, then x, then z
+      let guard = 0;
+      while (guard++ < 120) {
+        const cur = axis === 0 ? x : axis === 1 ? y : z;
+        const tgt = axis === 0 ? x1 : axis === 1 ? y1 : z1;
+        if (cur === tgt) break;
+        this._plan(x, y, z);
+        let nx = x, ny = y, nz = z;
+        if (axis === 0) nx = cl(x + Math.sign(x1 - x), W.sx - 2);
+        else if (axis === 1) ny = cl(y + Math.sign(y1 - y), W.sy - 2);
+        else nz = cl(z + Math.sign(z1 - z), W.sz - 2);
+        if (W.get(nx, ny, nz) === Material.ROCK) {
+          // step around the rock perpendicular, keeping the path contiguous
+          let routed = false;
+          for (const [ax, ay, az] of [[0, 0, 1], [0, 0, -1], [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0]]) {
+            const tx = cl(x + ax, W.sx - 2), ty = cl(y + ay, W.sy - 2), tz = cl(z + az, W.sz - 2);
+            if (W.get(tx, ty, tz) !== Material.ROCK) { nx = tx; ny = ty; nz = tz; routed = true; break; }
+          }
+          if (!routed) break;
         }
-        if (!routed) break; // boxed in by rock; stop the corridor here
+        x = nx; y = ny; z = nz;
       }
-      x = nx; y = ny; z = nz;
     }
     this._plan(x1, y1, z1);
   }
