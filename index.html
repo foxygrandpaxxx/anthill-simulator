@@ -35,10 +35,38 @@
         letter-spacing: 0.2px;
       }
       #panel .sub {
-        margin: 0 0 14px;
+        margin: 0;
         font-size: 11px;
         opacity: 0.55;
       }
+      #panelHeader {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 10px;
+      }
+      #collapseBtn {
+        flex: none;
+        width: 30px;
+        height: 28px;
+        padding: 0;
+        line-height: 1;
+        font-size: 14px;
+        color: #e8e2da;
+        background: rgba(255, 255, 255, 0.08);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      #panelBody {
+        margin-top: 14px;
+        max-height: calc(100vh - 130px);
+        overflow-y: auto;
+        overflow-x: hidden;
+      }
+      #panel.collapsed { width: auto; }
+      #panel.collapsed #panelBody { display: none; }
+      #panel.collapsed .sub { display: none; }
       .row { margin-bottom: 14px; }
       .row label {
         display: flex;
@@ -156,9 +184,15 @@
     <div id="app"></div>
 
     <div id="panel">
-      <h1>🐜 Anthill Simulator</h1>
-      <p class="sub">a living formicarium</p>
+      <div id="panelHeader">
+        <div>
+          <h1>🐜 Anthill Simulator</h1>
+          <p class="sub">a living formicarium</p>
+        </div>
+        <button id="collapseBtn" aria-label="Collapse panel" title="Collapse / expand">▾</button>
+      </div>
 
+      <div id="panelBody">
       <div class="row">
         <label>Cutaway axis</label>
         <div class="seg" id="axis">
@@ -232,6 +266,7 @@
           <button class="btn ghost" id="dropFood">🍃 Drop food: off</button>
         </div>
       </details>
+      </div><!-- #panelBody -->
     </div>
 
     <div id="inspect" class="hidden"></div>

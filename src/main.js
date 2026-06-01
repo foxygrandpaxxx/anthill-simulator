@@ -7,6 +7,17 @@ const container = document.getElementById("app");
 const renderer = new Renderer(container);
 window.__renderer = renderer;
 
+// Collapsible options panel (essential on mobile so the controls don't cover
+// the screen). Starts collapsed on narrow viewports.
+const panelEl = document.getElementById("panel");
+const collapseBtn = document.getElementById("collapseBtn");
+function setPanelCollapsed(c) {
+  panelEl.classList.toggle("collapsed", c);
+  collapseBtn.textContent = c ? "▸" : "▾";
+}
+collapseBtn.addEventListener("click", () => setPanelCollapsed(!panelEl.classList.contains("collapsed")));
+if (window.innerWidth < 640) setPanelCollapsed(true);
+
 const cutSlider = document.getElementById("cut");
 const cutVal = document.getElementById("cutVal");
 const axisButtons = document.querySelectorAll("#axis button");
