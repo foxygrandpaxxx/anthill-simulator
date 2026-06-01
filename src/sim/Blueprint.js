@@ -11,7 +11,7 @@ import { Material, isDiggable } from "../world/materials.js";
 
 export const DEFAULT_BLUEPRINT_CONFIG = {
   firstChamberDepth: 7, // voxels below surface for the first chamber center
-  chamberSpacingY: 6, // baseline distance between connected chambers
+  chamberSpacingY: 9, // baseline branch distance (must exceed no-overlap spacing)
   chamberRX: 3, // horizontal radius (x)
   chamberRZ: 3, // horizontal radius (z)
   chamberRY: 2, // vertical radius (oblate: flatter than wide)
@@ -145,17 +145,32 @@ export class Blueprint {
     const rBase = cfg.chamberRX;
     let best = null, bestScore = -Infinity;
 
-    // Branch only off chambers that are actually excavated (have an air cell),
-    // so new growth always connects to the live nest rather than a stranded plan.
+    // Branch only off chambers whose air is genuinely reachable from the
+    // entrance, so the new corridor always connects to the live nest (never
+    // strands behind food or undug soil).
+    const reached = this._reachableAirSet();
     const live = this.chambers.filter(
-      (c) => W.get(c.cx, c.cy, c.cz) === Material.AIR ||
-        c.cells.some(([x, y, z]) => W.get(x, y, z) === Material.AIR),
+      (c) => c.cells.some(([x, y, z]) => reached.has(this._idx(x, y, z))),
     );
-    const pool = live.length ? live : this.chambers;
+    // Nurseries cluster near the queen: branch them off existing nurseries so
+    // brood stays close to the founding chamber. Granaries branch off anything.
+    let pool = live.length ? live : this.chambers;
+    if (type === "nursery") {
+      const nurs = pool.filter((c) => c.type === "nursery");
+      if (nurs.length) pool = nurs;
+    }
+
+    // Centroid of the nest, so we can push new chambers outward to fill the tank.
+    let ccx = 0, ccz = 0;
+    for (const c of this.chambers) { ccx += c.cx; ccz += c.cz; }
+    ccx /= this.chambers.length; ccz /= this.chambers.length;
 
     for (let i = 0; i < cfg.branchTries; i++) {
       const parent = pool[(Math.random() * pool.length) | 0];
-      const ang = Math.random() * Math.PI * 2;
+      // Bias the branch direction outward (away from the nest centroid) so the
+      // nest expands into open ground rather than overlapping its own cluster.
+      const outward = Math.atan2(parent.cz - ccz, parent.cx - ccx);
+      const ang = outward + (Math.random() - 0.5) * Math.PI * 1.1;
       const len = cfg.chamberSpacingY * (0.85 + Math.random() * 0.9);
       const down = cfg.downwardBias + Math.random() * (1 - cfg.downwardBias);
       const out = Math.sqrt(Math.max(0, 1 - down * down));
@@ -186,16 +201,15 @@ export class Blueprint {
     if (!best) return null;
     const v = cfg.chamberSizeVar;
     const jitter = () => 1 + (Math.random() * 2 - 1) * v;
-    // Start the corridor at an already-EXCAVATED cell of the parent nearest the
-    // target, so the new chamber's planned cells connect to real dug air and are
-    // actually reachable (not stranded behind undug rock/soil).
-    let start = [best.parent.cx, best.parent.cy, best.parent.cz];
-    let sBest = Infinity;
+    // Start the corridor at an entrance-reachable air cell of the parent nearest
+    // the target, so the new chamber's planned cells are guaranteed reachable.
+    let start = null, sBest = Infinity;
     for (const [x, y, z] of best.parent.cells) {
-      if (this.world.get(x, y, z) !== Material.AIR) continue;
+      if (!reached.has(this._idx(x, y, z))) continue;
       const d = Math.abs(x - best.x) + Math.abs(y - best.y) + Math.abs(z - best.z);
       if (d < sBest) { sBest = d; start = [x, y, z]; }
     }
+    if (!start) return null; // parent not actually reachable; skip this round
     this._planCleanTunnel(start[0], start[1], start[2], best.x, best.y, best.z);
     return this._addChamberAt(
       best.x, best.y, best.z, type,
@@ -280,6 +294,60 @@ export class Blueprint {
     return this.pending.size > before;
   }
 
+  // Set of all air cells reachable from the entrance through air (the live,
+  // walkable nest). Used to guarantee new chambers connect to it.
+  _reachableAirSet() {
+    const W = this.world, e = this.entrance;
+    const set = new Set();
+    if (W.get(e.x, e.y, e.z) !== Material.AIR) return set;
+    const maxY = e.y; // don't flood up into the open sky — only the nest
+    set.add(this._idx(e.x, e.y, e.z));
+    const q = [[e.x, e.y, e.z]];
+    let h = 0;
+    const N = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+    while (h < q.length) {
+      const [x, y, z] = q[h++];
+      for (const [dx, dy, dz] of N) {
+        const nx = x + dx, ny = y + dy, nz = z + dz;
+        if (!W.inBounds(nx, ny, nz) || ny > maxY) continue;
+        const k = this._idx(nx, ny, nz);
+        if (set.has(k)) continue;
+        if (W.get(nx, ny, nz) === Material.AIR) { set.add(k); q.push([nx, ny, nz]); }
+      }
+    }
+    return set;
+  }
+
+  // Self-heal: any chamber that's been excavated but is no longer connected to
+  // the entrance gets a fresh corridor carved back to the nearest connected
+  // chamber, so the nest can never end up with stranded disconnected pockets.
+  reconnectStranded() {
+    const reached = this._reachableAirSet();
+    const connected = [], stranded = [];
+    for (const c of this.chambers) {
+      const dug = c.cells.some(([x, y, z]) => this.world.get(x, y, z) === Material.AIR);
+      if (!dug) continue;
+      const isReached = c.cells.some(([x, y, z]) => reached.has(this._idx(x, y, z)));
+      (isReached ? connected : stranded).push(c);
+    }
+    for (const c of stranded) {
+      let best = null, bd = Infinity;
+      for (const rc of connected) {
+        const d = Math.abs(rc.cx - c.cx) + Math.abs(rc.cy - c.cy) + Math.abs(rc.cz - c.cz);
+        if (d < bd) { bd = d; best = rc; }
+      }
+      if (!best) continue;
+      let start = null, sb = Infinity;
+      for (const [x, y, z] of best.cells) {
+        if (!reached.has(this._idx(x, y, z))) continue;
+        const d = Math.abs(x - c.cx) + Math.abs(y - c.cy) + Math.abs(z - c.cz);
+        if (d < sb) { sb = d; start = [x, y, z]; }
+      }
+      if (start) this._planCleanTunnel(start[0], start[1], start[2], c.cx, c.cy, c.cz);
+    }
+    return stranded.length;
+  }
+
   onDug(x, y, z) {
     this.pending.delete(this._idx(x, y, z));
   }
@@ -349,15 +417,22 @@ export class Blueprint {
     return this.chambers.filter((c) => c.type === type);
   }
 
-  // All cells of every storage chamber, sorted bottom-up so food piles fill
-  // from the floor. Cached and rebuilt whenever a chamber is added.
+  // Cells a granary may fill with food (piled on the floor, bottom-up). Only the
+  // BOTTOM HALF (below the chamber's mid-height) is filled; the centre and top
+  // stay open air so the connecting corridor (which meets the chamber at its
+  // centre) never gets walled off by food and ants can always walk over the pile.
+  // A chamber is filled only once fully excavated, so food can't block digging.
   storageFillCells() {
-    if (this._storeCells && this._storeCellsAt === this.chambers.length) return this._storeCells;
     const cells = [];
-    for (const c of this.chambersOfType("storage")) for (const cell of c.cells) cells.push(cell);
+    for (const c of this.chambersOfType("storage")) {
+      let incomplete = false;
+      for (const [x, y, z] of c.cells) {
+        if (this.pending.has(this._idx(x, y, z))) { incomplete = true; break; }
+      }
+      if (incomplete) continue; // still being dug — don't fill it yet
+      for (const cell of c.cells) if (cell[1] < c.cy) cells.push(cell); // below mid-height
+    }
     cells.sort((a, b) => a[1] - b[1]); // y ascending
-    this._storeCells = cells;
-    this._storeCellsAt = this.chambers.length;
     return cells;
   }
 

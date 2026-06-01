@@ -150,7 +150,7 @@ export class Renderer {
 
   initColony(maxAnts, maxBrood) {
     // Dispose any previous colony meshes.
-    for (const m of [this.antMesh, this.loadMesh, this.broodMesh, this.queenMesh]) {
+    for (const m of [this.antMesh, this.loadMesh, this.broodMesh, this.queenMesh, this.foodMesh]) {
       if (m) { this.worldGroup.remove(m); m.geometry.dispose(); }
     }
     this.maxAnts = maxAnts;
@@ -182,6 +182,15 @@ export class Renderer {
     this.queenMesh = new THREE.Mesh(makeQueenGeometry(), queenMat);
     this.queenMesh.visible = false;
     this.worldGroup.add(this.queenMesh);
+
+    // Stored food — a visual pile overlay that fills granary chambers. It's NOT
+    // part of the voxel world, so food never blocks a tunnel.
+    this.maxFood = 6000;
+    const foodMat = new THREE.MeshStandardMaterial({ color: 0xd9a431, roughness: 0.6, metalness: 0.1 });
+    this.foodMesh = new THREE.InstancedMesh(new THREE.BoxGeometry(0.85, 0.85, 0.85), foodMat, this.maxFood);
+    this.foodMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.foodMesh.frustumCulled = false;
+    this.worldGroup.add(this.foodMesh);
 
     // Predators (spiders) — a few at most.
     this.maxPredators = 8;
@@ -244,6 +253,7 @@ export class Renderer {
     glow(this.broodMesh, 0x4a4530);
     glow(this.queenMesh, 0x7a1c1c);
     glow(this.predatorMesh, 0x661010);
+    glow(this.foodMesh, 0x6a4a10);
   }
 
   _cutTest(cut) {
@@ -396,6 +406,32 @@ export class Renderer {
       this.pheroMesh.instanceMatrix.needsUpdate = true;
       if (this.pheroMesh.instanceColor) this.pheroMesh.instanceColor.needsUpdate = true;
     }
+
+    this.updateFoodPiles(sim, cut);
+  }
+
+  // Render stored food as a pile filling the granary chambers bottom-up. Purely
+  // visual — these cubes aren't voxels, so they can't block tunnels.
+  updateFoodPiles(sim, cut) {
+    if (!this.foodMesh) return;
+    const removed = this._cutTest(cut);
+    const d = this._dummy;
+    const cells = sim.blueprint.storageFillCells(); // sorted bottom-up
+    const target = Math.max(0, Math.floor((sim.storedFood - sim.cfg.baseStorageCapacity) / sim.cfg.foodPerStoreVoxel));
+    const n = Math.min(target, cells.length, this.maxFood);
+    let i = 0;
+    for (let c = 0; c < n; c++) {
+      const cell = cells[c];
+      if (removed(cell[0], cell[1], cell[2])) continue;
+      d.position.set(cell[0] + 0.5, cell[1] + 0.5, cell[2] + 0.5);
+      d.rotation.set(0, 0, 0);
+      d.scale.setScalar(1);
+      d.updateMatrix();
+      this.foodMesh.setMatrixAt(i, d.matrix);
+      i++;
+    }
+    this.foodMesh.count = i;
+    this.foodMesh.instanceMatrix.needsUpdate = true;
   }
 
   // Center the world block at the origin and frame it with the camera.
