@@ -39,7 +39,7 @@ export const DEFAULT_SIM_CONFIG = {
 
   // Surface food keeps trickling back so the tank has a carrying capacity
   // instead of starving to zero.
-  foodRespawnInterval: 20, // ticks between new surface food drops
+  foodRespawnInterval: 200, // ticks between new surface food drops (~10% of prior rate)
   foodRespawnClusterSize: 8,
 
   // Founding
